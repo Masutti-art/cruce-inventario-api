@@ -29,3 +29,5 @@ async def upload_file(file: UploadFile = File(...)):
     output.seek(0)
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": "attachment; filename=cruce_resultado.xlsx"})
+    # Pequeño cambio para activar despliegue en Render
+    
