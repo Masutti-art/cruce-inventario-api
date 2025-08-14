@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: cruce-api
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: bash start.sh
+    envVars:
+      - key: PORT
+        value: 10000
