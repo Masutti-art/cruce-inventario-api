@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-pandas
+pandas==1.5.3
 openpyxl
 xlrd==1.2.0
 pyxlsb
