@@ -154,66 +154,97 @@ async def upload(file: UploadFile = File(...)):
         "columnas_detectadas": list(map(str, df.columns))[:30],
         "status": "ok"
     })
-
-# ---------------- Cruce ----------------
+# --------------- Cruce ---------------
 def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
+
     alias = {
-        # codigo
+        # --- codigo ---
         "material": "codigo", "codigo": "codigo", "sku": "codigo", "item": "codigo",
-        # descripcion
+        "item code": "codigo", "codigo articulo": "codigo", "cod articulo": "codigo",
+        "cod": "codigo", "material code": "codigo", "sap code": "codigo",
+        "ubprod": "codigo",  # BUNKER
+
+        # --- descripcion ---
         "material description": "descripcion", "description": "descripcion",
         "descripción": "descripcion", "descripcion": "descripcion",
-        # storage
-        "storage location": "storage", "storage": "storage", "almacen": "storage",
-        "depósito": "storage", "bodega": "storage",
-        # cajas
-        "bultos": "cajas", "cajas": "cajas", "bum quantity": "cajas",
-        "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas"
-    }
-    df = df.rename(columns={c: alias.get(c, c) for c in df.columns})
-    return df
+        "item name": "descripcion", "product": "descripcion", "producto": "descripcion",
+        "nombre": "descripcion",
+        "itdesc": "descripcion",  # BUNKER
 
+        # --- storage / deposito ---
+        "storage location": "storage", "storage": "storage", "almacen": "storage",
+        "deposito": "storage", "depósito": "storage", "warehouse": "storage",
+        "ubicacion": "storage", "ubicación": "storage", "location": "storage",
+        "ubiest": "storage",  # BUNKER
+
+        # --- cantidad (cajas) ---
+        "cajas": "cajas", "bultos": "cajas", "bum quantity": "cajas",
+        "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas",
+        "cant cajas": "cajas", "boxes": "cajas", "box qty": "cajas",
+        "cartones": "cajas", "ctns": "cajas",
+        "ubcfisi": "cajas",  # BUNKER
+    }
+
+    # aplicar los alias
+    df = df.rename(columns=lambda c: alias.get(c, c))
+
+    return df
 def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
+    """
+    - Normaliza nombres y aplica alias
+    - Valida columnas mínimas: codigo + storage (obligatorias)
+    - Crea columnas opcionales si faltan: cajas=0, descripcion=""
+    - Tipifica y agrupa por (codigo, storage) sumando cajas
+    """
     df = normalize_df(raw_df)
     df = _alias_columns(df)
 
-    # columnas mínimas
+    # --- columnas mínimas obligatorias ---
     cols_min = {"codigo", "storage"}
     if not cols_min.issubset(df.columns):
         faltan = sorted(list(cols_min - set(df.columns)))
-        raise HTTPException(status_code=400, detail={
-            "error": f"El archivo '{archivo}' no contiene columnas mínimas",
-            "faltan": faltan,
-            "esperadas": ["codigo", "storage", "cajas (opcional)", "descripcion (opcional)"],
-            "columnas_detectadas": list(df.columns),
-        })
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"El archivo '{archivo}' no contiene columnas mínimas",
+                "faltan": faltan,
+                "esperadas": ["codigo", "storage", "cajas (opcional)", "descripcion (opcional)"],
+                "columnas_detectadas": list(df.columns),
+            },
+        )
 
+    # --- columnas opcionales ---
     if "cajas" not in df.columns:
         df["cajas"] = 0
+    if "descripcion" not in df.columns:
+        df["descripcion"] = ""
 
+    # --- normalización de tipos / limpieza ---
     df["codigo"] = df["codigo"].astype(str).str.strip()
     df["storage"] = df["storage"].astype(str).str.strip()
 
     def _to_float(x):
-        try: return float(str(x).replace(",", "."))
-        except Exception: return 0.0
+        try:
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return 0.0
+
     df["cajas"] = df["cajas"].map(_to_float)
 
-    keep = ["codigo", "storage", "cajas"]
-    if "descripcion" in df.columns:
-        keep.append("descripcion")
-    df = df[keep]
+    # --- quedarnos con columnas clave ---
+    df = df[["codigo", "storage", "cajas", "descripcion"]]
 
-    agg = {"cajas": "sum"}
-    if "descripcion" in df.columns:
-        agg["descripcion"] = "first"
+    # --- agrupar por clave y sumar cajas; 1ra descripcion no vacía ---
+    df = (
+        df.sort_values(["codigo", "storage"])  # para que "first" sea estable
+          .groupby(["codigo", "storage"], as_index=False)
+          .agg({"cajas": "sum", "descripcion": "first"})
+    )
 
-    df = df.groupby(["codigo", "storage"], as_index=False).agg(agg)
     df["archivo"] = archivo
     return df
-
 @app.post("/cruce")
 async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
     if len(files) < 2:
