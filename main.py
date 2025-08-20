@@ -148,3 +148,65 @@ async def upload(file: UploadFile = File(...)):
         "columnas_detectadas": list(map(str, df.columns))[:30],
         "status": "ok"
     })
+    from fastapi import UploadFile, File
+import pandas as pd
+import io
+
+@app.post("/cruce")
+async def cruce_archivos(files: list[UploadFile] = File(...)):
+    """
+    Recibe 2 o más archivos Excel/CSV y devuelve cruce por Codigo+Storage
+    """
+
+    dataframes = []
+    for file in files:
+        contents = await file.read()
+        try:
+            if file.filename.endswith(".csv"):
+                df = pd.read_csv(io.BytesIO(contents))
+            else:  # Excel (xlsx, xls, xlsb, etc.)
+                df = pd.read_excel(io.BytesIO(contents))
+        except Exception as e:
+            return {"error": f"No se pudo leer {file.filename}: {str(e)}"}
+
+        # Normalizar nombres de columnas
+        df.columns = df.columns.str.strip().str.lower()
+        rename_map = {
+            "material": "codigo",
+            "codigo": "codigo",
+            "description": "descripcion",
+            "material description": "descripcion",
+            "storage location": "storage",
+            "almacen": "storage",
+            "bultos": "cajas",
+            "cajas": "cajas",
+            "bum quantity": "cajas"
+        }
+        df = df.rename(columns=rename_map)
+
+        # Solo columnas necesarias
+        cols_needed = ["codigo", "descripcion", "storage", "cajas"]
+        df = df[[c for c in cols_needed if c in df.columns]]
+        df["archivo"] = file.filename
+        dataframes.append(df)
+
+    if len(dataframes) < 2:
+        return {"error": "Necesitas al menos 2 archivos para cruzar."}
+
+    # Unir por codigo + storage
+    resultado = dataframes[0]
+    for df in dataframes[1:]:
+        resultado = pd.merge(
+            resultado,
+            df,
+            on=["codigo", "storage"],
+            how="outer",
+            suffixes=("", "_"+df["archivo"].iloc[0].split('.')[0])
+        )
+
+    # Rellenar vacíos con 0
+    resultado = resultado.fillna(0)
+
+    # Convertir a lista de dicts
+    return resultado.to_dict(orient="records")
+
