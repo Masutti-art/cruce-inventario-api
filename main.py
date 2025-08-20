@@ -1,3 +1,4 @@
+from typing import List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import pandas as pd
@@ -8,6 +9,7 @@ app = FastAPI(title="Cruce Inventario API", version="3.0.0")
 REQUIRED_SHEET = "Comparacion Inventario"
 FALLBACK_SHEETS = ["Comparación Inventario", "Data"]
 
+# ---------------- CSV ----------------
 def sniff_csv_delimiter(sample: bytes) -> str:
     try:
         txt = sample.decode("utf-8", errors="ignore")
@@ -23,6 +25,7 @@ def read_csv_like(file_bytes: bytes) -> pd.DataFrame:
     delim = sniff_csv_delimiter(file_bytes)
     return pd.read_csv(io.BytesIO(file_bytes), delimiter=delim)
 
+# ---------------- Excel helpers ----------------
 def pick_sheet_name(xl: pd.ExcelFile) -> str:
     sheets = set(xl.sheet_names)
     if REQUIRED_SHEET in sheets:
@@ -49,9 +52,10 @@ def read_xlsx(file_bytes: bytes) -> pd.DataFrame:
 def read_xls(file_bytes: bytes) -> pd.DataFrame:
     try:
         df_dict = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine="xlrd")
+        # elegir hoja
         sheet = REQUIRED_SHEET if REQUIRED_SHEET in df_dict else None
         if not sheet:
-            for fb in [*FALLBACK_SHEETS]:
+            for fb in FALLBACK_SHEETS:
                 if fb in df_dict:
                     sheet = fb
                     break
@@ -80,7 +84,7 @@ def read_ods(file_bytes: bytes) -> pd.DataFrame:
         df_dict = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine="odf")
         sheet = REQUIRED_SHEET if REQUIRED_SHEET in df_dict else None
         if not sheet:
-            for fb in [*FALLBACK_SHEETS]:
+            for fb in FALLBACK_SHEETS:
                 if fb in df_dict:
                     sheet = fb
                     break
@@ -109,7 +113,7 @@ def read_zip_single_table(file_bytes: bytes) -> pd.DataFrame:
 def read_any_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     ext = filename.lower().split(".")[-1]
     if ext == "xlsx": return read_xlsx(file_bytes)
-    if ext == "xls":  return read_xls(file_bytes)
+    if ext == "xls":  return read_xls(file_bytes)        # <-- usa xlrd
     if ext == "xlsb": return read_xlsb(file_bytes)
     if ext == "ods":  return read_ods(file_bytes)
     if ext in ("csv", "tsv", "txt"): return read_csv_like(file_bytes)
@@ -121,9 +125,11 @@ def read_any_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
             detail=f"Extensión no soportada: .{ext}. Usa .xlsx/.xls/.xlsb/.ods/.csv/.tsv/.txt o .zip con 1 archivo.")
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
+# ---------------- Endpoints simples ----------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -148,65 +154,141 @@ async def upload(file: UploadFile = File(...)):
         "columnas_detectadas": list(map(str, df.columns))[:30],
         "status": "ok"
     })
-    from fastapi import UploadFile, File
-import pandas as pd
-import io
+
+# ---------------- Cruce ----------------
+def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    alias = {
+        # codigo
+        "material": "codigo", "codigo": "codigo", "sku": "codigo", "item": "codigo",
+        # descripcion
+        "material description": "descripcion", "description": "descripcion",
+        "descripción": "descripcion", "descripcion": "descripcion",
+        # storage
+        "storage location": "storage", "storage": "storage", "almacen": "storage",
+        "depósito": "storage", "bodega": "storage",
+        # cajas
+        "bultos": "cajas", "cajas": "cajas", "bum quantity": "cajas",
+        "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas"
+    }
+    df = df.rename(columns={c: alias.get(c, c) for c in df.columns})
+    return df
+
+def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
+    df = normalize_df(raw_df)
+    df = _alias_columns(df)
+
+    # columnas mínimas
+    cols_min = {"codigo", "storage"}
+    if not cols_min.issubset(df.columns):
+        faltan = sorted(list(cols_min - set(df.columns)))
+        raise HTTPException(status_code=400, detail={
+            "error": f"El archivo '{archivo}' no contiene columnas mínimas",
+            "faltan": faltan,
+            "esperadas": ["codigo", "storage", "cajas (opcional)", "descripcion (opcional)"],
+            "columnas_detectadas": list(df.columns),
+        })
+
+    if "cajas" not in df.columns:
+        df["cajas"] = 0
+
+    df["codigo"] = df["codigo"].astype(str).str.strip()
+    df["storage"] = df["storage"].astype(str).str.strip()
+
+    def _to_float(x):
+        try: return float(str(x).replace(",", "."))
+        except Exception: return 0.0
+    df["cajas"] = df["cajas"].map(_to_float)
+
+    keep = ["codigo", "storage", "cajas"]
+    if "descripcion" in df.columns:
+        keep.append("descripcion")
+    df = df[keep]
+
+    agg = {"cajas": "sum"}
+    if "descripcion" in df.columns:
+        agg["descripcion"] = "first"
+
+    df = df.groupby(["codigo", "storage"], as_index=False).agg(agg)
+    df["archivo"] = archivo
+    return df
 
 @app.post("/cruce")
-async def cruce_archivos(files: list[UploadFile] = File(...)):
-    """
-    Recibe 2 o más archivos Excel/CSV y devuelve cruce por Codigo+Storage
-    """
+async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Sube al menos 2 archivos para cruzar.")
 
-    dataframes = []
-    for file in files:
-        contents = await file.read()
+    # Leer TODOS con nuestra función que soporta xlsx/xls/csv/ods/xlsb/zip
+    cargados = []
+    for up in files:
+        raw = await up.read()
         try:
-            if file.filename.endswith(".csv"):
-                df = pd.read_csv(io.BytesIO(contents))
-            else:  # Excel (xlsx, xls, xlsb, etc.)
-                df = pd.read_excel(io.BytesIO(contents))
+            base_name = (up.filename or "archivo").rsplit(".", 1)[0]
+            df_raw = read_any_table(raw, up.filename or "upload.bin")
+            df_pre = _prepare_input_df(df_raw, up.filename or base_name)
+            df_pre = df_pre.rename(columns={"cajas": f"cajas_{base_name}"})
+            cargados.append((base_name, df_pre))
+        except HTTPException:
+            raise
         except Exception as e:
-            return {"error": f"No se pudo leer {file.filename}: {str(e)}"}
+            raise HTTPException(status_code=400, detail=f"No pude procesar '{up.filename}': {str(e)}")
 
-        # Normalizar nombres de columnas
-        df.columns = df.columns.str.strip().str.lower()
-        rename_map = {
-            "material": "codigo",
-            "codigo": "codigo",
-            "description": "descripcion",
-            "material description": "descripcion",
-            "storage location": "storage",
-            "almacen": "storage",
-            "bultos": "cajas",
-            "cajas": "cajas",
-            "bum quantity": "cajas"
-        }
-        df = df.rename(columns=rename_map)
+    # Merge OUTER por (codigo, storage)
+    merged = None
+    for i, (name, df_i) in enumerate(cargados):
+        if merged is None:
+            merged = df_i
+        else:
+            merged = pd.merge(
+                merged,
+                df_i[["codigo", "storage", f"cajas_{name}"]],
+                on=["codigo", "storage"],
+                how="outer",
+            )
 
-        # Solo columnas necesarias
-        cols_needed = ["codigo", "descripcion", "storage", "cajas"]
-        df = df[[c for c in cols_needed if c in df.columns]]
-        df["archivo"] = file.filename
-        dataframes.append(df)
+    # Completar descripcion si falta
+    if "descripcion" not in merged.columns:
+        merged["descripcion"] = None
+    for (_, df_i) in cargados[1:]:
+        if "descripcion" in df_i.columns:
+            merged["descripcion"] = merged["descripcion"].fillna(
+                pd.merge(
+                    merged[["codigo", "storage"]],
+                    df_i[["codigo", "storage", "descripcion"]],
+                    on=["codigo", "storage"],
+                    how="left",
+                )["descripcion"]
+            )
 
-    if len(dataframes) < 2:
-        return {"error": "Necesitas al menos 2 archivos para cruzar."}
+    # Rellenar NaN en cajas
+    caja_cols = [c for c in merged.columns if c.startswith("cajas_")]
+    for c in caja_cols:
+        merged[c] = merged[c].fillna(0)
 
-    # Unir por codigo + storage
-    resultado = dataframes[0]
-    for df in dataframes[1:]:
-        resultado = pd.merge(
-            resultado,
-            df,
-            on=["codigo", "storage"],
-            how="outer",
-            suffixes=("", "_"+df["archivo"].iloc[0].split('.')[0])
-        )
+    # Diferencias contra el primer archivo como base
+    base_name = cargados[0][0]
+    base_col = f"cajas_{base_name}"
+    diff_cols = []
+    for name, _ in cargados[1:]:
+        col = f"cajas_{name}"
+        dcol = f"diff_{name}_vs_{base_name}"
+        merged[dcol] = merged[col] - merged[base_col]
+        diff_cols.append(dcol)
 
-    # Rellenar vacíos con 0
-    resultado = resultado.fillna(0)
+    diffs_only = merged.loc[(merged[diff_cols] != 0).any(axis=1)] if diff_cols else merged.copy()
+    resumen = {
+        "archivos": [n for (n, _) in cargados],
+        "total_claves": int(len(merged)),
+        "con_diferencias": int(len(diffs_only)),
+        "sin_diferencias": int(len(merged) - len(diffs_only)),
+    }
+    cols_order = ["codigo", "descripcion", "storage"] + caja_cols + diff_cols
+    merged = merged[cols_order].sort_values(["codigo", "storage"]).reset_index(drop=True)
+    diffs_only = diffs_only[cols_order].sort_values(["codigo", "storage"]).reset_index(drop=True)
 
-    # Convertir a lista de dicts
-    return resultado.to_dict(orient="records")
-
+    return {
+        "resumen": resumen,
+        "diferencias": diffs_only.to_dict(orient="records"),
+        "todo": merged.to_dict(orient="records"),
+    }
