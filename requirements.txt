@@ -1,7 +1,12 @@
-fastapi
-uvicorn[standard]
-pandas
-openpyxl
-pyxlsb
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Excel / CSV / ODS
+pandas==2.2.2
+openpyxl==3.1.5
 xlrd==1.2.0
-python-multipart
+pyxlsb==1.0.10
+odfpy==1.4.1
+
+# Uploads con FastAPI
+python-multipart==0.0.9
