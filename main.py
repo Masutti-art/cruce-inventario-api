@@ -101,10 +101,8 @@ def read_zip_single_table(file_bytes: bytes) -> pd.DataFrame:
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             candidates = [
-                n
-                for n in zf.namelist()
-                if not n.endswith("/")
-                and n.lower().split(".")[-1] in ("xlsx", "xls", "xlsb", "ods", "csv", "tsv", "txt")
+                n for n in zf.namelist()
+                if not n.endswith("/") and n.lower().split(".")[-1] in ("xlsx", "xls", "xlsb", "ods", "csv", "tsv", "txt")
             ]
             if len(candidates) != 1:
                 raise HTTPException(
@@ -120,24 +118,18 @@ def read_zip_single_table(file_bytes: bytes) -> pd.DataFrame:
 
 def read_any_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     ext = filename.lower().split(".")[-1]
-    if ext == "xlsx":
-        return read_xlsx(file_bytes)
-    if ext == "xls":
-        return read_xls(file_bytes)
-    if ext == "xlsb":
-        return read_xlsb(file_bytes)
-    if ext == "ods":
-        return read_ods(file_bytes)
-    if ext in ("csv", "tsv", "txt"):
-        return read_csv_like(file_bytes)
-    if ext == "zip":
-        return read_zip_single_table(file_bytes)
+    if ext == "xlsx": return read_xlsx(file_bytes)
+    if ext == "xls":  return read_xls(file_bytes)
+    if ext == "xlsb": return read_xlsb(file_bytes)
+    if ext == "ods":  return read_ods(file_bytes)
+    if ext in ("csv", "tsv", "txt"): return read_csv_like(file_bytes)
+    if ext == "zip":  return read_zip_single_table(file_bytes)
     try:
         return read_xlsx(file_bytes)  # último intento
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail=f"Extensión no soportada: .{ext}. Usa .xlsx/.xls/.xlsb/.ods/.csv/.tsv/.txt o .zip con 1 archivo.",
+            detail=f"Extensión no soportada: .{ext}. Usa .xlsx/.xls/.xlsb/.ods/.csv/.tsv/.txt o .zip con 1 archivo."
         )
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -163,15 +155,13 @@ async def upload(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"No se pudo procesar el archivo: {str(e)}")
 
-    return JSONResponse(
-        {
-            "archivo": file.filename,
-            "filas": int(len(df)),
-            "columnas": int(len(df.columns)),
-            "columnas_detectadas": list(map(str, df.columns))[:50],
-            "status": "ok",
-        }
-    )
+    return JSONResponse({
+        "archivo": file.filename,
+        "filas": int(len(df)),
+        "columnas": int(len(df.columns)),
+        "columnas_detectadas": list(map(str, df.columns))[:50],
+        "status": "ok"
+    })
 
 # ---------- Cruce ----------
 def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -179,58 +169,36 @@ def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     alias = {
-        # codigo
-        "material": "codigo",
-        "codigo": "codigo",
-        "sku": "codigo",
-        "item": "codigo",
-        "item code": "codigo",
-        "codigo articulo": "codigo",
-        "cod articulo": "codigo",
-        "cod": "codigo",
-        "material code": "codigo",
-        "sap code": "codigo",
+        # --- codigo ---
+        "material": "codigo", "codigo": "codigo", "sku": "codigo", "item": "codigo",
+        "item code": "codigo", "codigo articulo": "codigo", "cod articulo": "codigo",
+        "cod": "codigo", "material code": "codigo", "sap code": "codigo",
         "ubprod": "codigo",  # BUNKER
 
-        # descripcion
-        "material description": "descripcion",
-        "description": "descripcion",
-        "descripción": "descripcion",
-        "descripcion": "descripcion",
-        "item name": "descripcion",
-        "product": "descripcion",
-        "producto": "descripcion",
+        # --- descripcion ---
+        "material description": "descripcion", "description": "descripcion",
+        "descripción": "descripcion", "descripcion": "descripcion",
+        "item name": "descripcion", "product": "descripcion", "producto": "descripcion",
         "nombre": "descripcion",
         "itdesc": "descripcion",  # BUNKER
 
-        # storage / deposito
-        "storage location": "storage",
-        "storage": "storage",
-        "almacen": "storage",
-        "deposito": "storage",
-        "depósito": "storage",
-        "warehouse": "storage",
-        "ubicacion": "storage",
-        "ubicación": "storage",
-        "location": "storage",
-        "ubiest": "storage",   # BUNKER
-        "emplaza": "storage",  # BUNKER variante nueva
-        "estante": "storage",  # BUNKER variante nueva
-        "columna": "storage",  # BUNKER variante nueva
+        # --- storage / deposito ---
+        "storage location": "storage", "storage": "storage", "almacen": "storage",
+        "deposito": "storage", "depósito": "storage", "warehouse": "storage",
+        "ubicacion": "storage", "ubicación": "storage", "location": "storage",
+        "ubiest": "storage",     # BUNKER
+        "emplaza": "storage",    # BUNKER variante
+        "estante": "storage",    # BUNKER variante
+        "columna": "storage",    # BUNKER variante
+        "nivel": "storage",      # BUNKER variante NUEVA (detectada)
+        "ubcia": "storage",      # BUNKER variante NUEVA (detectada)
 
-        # cantidad (cajas)
-        "cajas": "cajas",
-        "bultos": "cajas",
-        "bum quantity": "cajas",
-        "qty": "cajas",
-        "cantidad": "cajas",
-        "cantidad cajas": "cajas",
-        "cant cajas": "cajas",
-        "boxes": "cajas",
-        "box qty": "cajas",
-        "cartones": "cajas",
-        "ctns": "cajas",
-        "ubcfisi": "cajas",  # BUNKER
+        # --- cantidad (cajas) ---
+        "cajas": "cajas", "bultos": "cajas", "bum quantity": "cajas",
+        "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas",
+        "cant cajas": "cajas", "boxes": "cajas", "box qty": "cajas",
+        "cartones": "cajas", "ctns": "cajas",
+        "ubcfisi": "cajas",     # BUNKER
     }
 
     df = df.rename(columns=lambda c: alias.get(c, c))
@@ -282,7 +250,7 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     if "descripcion" not in df.columns:
         df["descripcion"] = ""
 
-    # si por duplicados siguiera quedando DataFrame en vez de Serie, colapsar
+    # si por duplicados quedara DataFrame en vez de Serie, colapsar
     def _collapse_to_series(_df: pd.DataFrame, col: str) -> pd.DataFrame:
         val = _df[col]
         if isinstance(val, pd.DataFrame):
@@ -302,15 +270,14 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
             return float(str(x).replace(",", "."))
         except Exception:
             return 0.0
-
     df["cajas"] = df["cajas"].map(_to_float)
 
     # columnas finales y agrupación
     df = df[["codigo", "storage", "cajas", "descripcion"]]
     df = (
         df.sort_values(["codigo", "storage"])
-        .groupby(["codigo", "storage"], as_index=False)
-        .agg({"cajas": "sum", "descripcion": "first"})
+          .groupby(["codigo", "storage"], as_index=False)
+          .agg({"cajas": "sum", "descripcion": "first"})
     )
     df["archivo"] = archivo
     return df
@@ -336,7 +303,7 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
 
     # merge outer por clave
     merged = None
-    for i, (name, df_i) in enumerate(cargados):
+    for name, df_i in cargados:
         if merged is None:
             merged = df_i
         else:
@@ -350,7 +317,7 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
     # completar descripcion si falta con la 1ra no nula encontrada
     if "descripcion" not in merged.columns:
         merged["descripcion"] = None
-    for (_, df_i) in cargados[1:]:
+    for _, df_i in cargados[1:]:
         if "descripcion" in df_i.columns:
             merged["descripcion"] = merged["descripcion"].fillna(
                 pd.merge(
