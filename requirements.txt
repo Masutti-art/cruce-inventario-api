@@ -4,3 +4,4 @@ pandas
 openpyxl
 pyxlsb
 xlrd==1.2.0
+python-multipart
