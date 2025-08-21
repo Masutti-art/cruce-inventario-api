@@ -1,8 +1,6 @@
 fastapi
 uvicorn[standard]
-pandas<=1.5.3
+pandas
 openpyxl
 pyxlsb
-odfpy
-python-multipart
 xlrd==1.2.0
