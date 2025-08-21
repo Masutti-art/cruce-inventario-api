@@ -373,3 +373,201 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
         "diferencias": diffs_only.to_dict(orient="records"),
         "todo": merged.to_dict(orient="records"),
     }
+# ===================== HÍBRIDO: BUNKER por SKU vs SAP, CBP por STORAGE vs SAP =====================
+
+def _identify_roles(cargados: List[tuple]) -> Dict[str, str]:
+    """
+    Devuelve nombres detectados por heurística:
+    - sap_name: contiene 'SAP'
+    - bunker_name: contiene 'BUNKER'
+    - cbp_name: contiene 'CBP' o 'SAAD CBP' (si no hay, el primero distinto de SAP y BUNKER)
+    """
+    upper_names = [(name, name.upper()) for name, _ in cargados]
+    sap_name = next((n for n,u in upper_names if "SAP" in u), cargados[0][0])
+    bunker_name = next((n for n,u in upper_names if "BUNKER" in u), None)
+    cbp_name = next((n for n,u in upper_names if "CBP" in u or "SAAD CBP" in u), None)
+    if cbp_name is None:
+        cbp_name = next((n for n,_ in cargados if n != sap_name and n != bunker_name), None)
+    return {"sap": sap_name, "bunker": bunker_name, "cbp": cbp_name}
+
+def _sku_level(df: pd.DataFrame, colname: str) -> pd.DataFrame:
+    """Agrupa por SKU (codigo), suma cajas y toma primera descripción."""
+    return (
+        df.groupby("codigo", as_index=False)
+          .agg({"cajas": "sum", "descripcion": "first"})
+          .rename(columns={"cajas": colname})
+    )
+
+def _storage_level(df: pd.DataFrame, colname: str) -> pd.DataFrame:
+    """Asegura columnas para merge por codigo+storage y renombra cajas."""
+    out = df.copy()
+    return out.rename(columns={"cajas": colname})
+
+@app.post("/cruce/hibrido/xlsx")
+async def cruce_hibrido_excel(files: List[UploadFile] = File(...), min_diff: float = 0.0):
+    """
+    Híbrido:
+      - BUNKER vs SAP por SKU (ignora storage)
+      - SAAD CBP vs SAP por (codigo, storage)
+    Genera un Excel con Resumen (+ gráfico), Dif_SKU_BUNKER_vs_SAP, Dif_STORAGE_SAAD_CBP_vs_SAP, Todo_SKU y Todo_STORAGE.
+    Param:
+      - min_diff: umbral mínimo absoluto para listar diferencias (p.ej. 1.0)
+    """
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Sube al menos 2 archivos (SAP + BUNKER/CBP).")
+
+    # 1) Leer y normalizar con tus helpers
+    cargados = []
+    for up in files:
+        raw = await up.read()
+        base_name = (up.filename or "archivo").rsplit(".", 1)[0]
+        df_raw = read_any_table(raw, up.filename or "upload.bin")
+        df_pre = _prepare_input_df(df_raw, up.filename or base_name)
+        # Normalización práctica de storage
+        if "storage" in df_pre.columns:
+            df_pre["storage"] = df_pre["storage"].replace(["", "nan", "None", "TB-TB"], "N/A")
+        cargados.append((base_name, df_pre))
+
+    # 2) Identificar roles (sap/bunker/cbp)
+    roles = _identify_roles(cargados)
+    sap_name = roles["sap"]
+    bunker_name = roles["bunker"]
+    cbp_name = roles["cbp"]
+
+    # Mapear nombres -> dataframes
+    by_name = {name: df for name, df in cargados}
+    if sap_name not in by_name:
+        raise HTTPException(status_code=400, detail="No se pudo identificar el archivo SAP.")
+
+    df_sap = by_name[sap_name]
+
+    # 3) Tablas SKU (BUNKER vs SAP por SKU)
+    #    - SAP SKU total = suma de todas sus storages por SKU
+    sap_sku = _sku_level(df_sap, f"cajas_{sap_name}")
+    bunker_sku = None
+    if bunker_name and bunker_name in by_name:
+        bunker_sku = _sku_level(by_name[bunker_name], f"cajas_{bunker_name}")
+        sku_merged = pd.merge(sap_sku, bunker_sku, on="codigo", how="outer")
+        # completar descripcion desde cualquiera
+        if "descripcion" not in sku_merged.columns:
+            sku_merged["descripcion"] = None
+        for src in (sap_sku, bunker_sku):
+            sku_merged["descripcion"] = sku_merged["descripcion"].fillna(
+                pd.merge(sku_merged[["codigo"]],
+                         src[["codigo", "descripcion"]],
+                         on="codigo", how="left")["descripcion"]
+            )
+        # NaN -> 0 en cajas
+        for c in [f"cajas_{sap_name}", f"cajas_{bunker_name}"]:
+            if c in sku_merged.columns:
+                sku_merged[c] = sku_merged[c].fillna(0)
+        # diff bunker vs sap
+        if f"cajas_{bunker_name}" not in sku_merged.columns:
+            sku_merged[f"cajas_{bunker_name}"] = 0
+        sku_merged[f"diff_{bunker_name}_vs_{sap_name}"] = (
+            sku_merged[f"cajas_{bunker_name}"] - sku_merged[f"cajas_{sap_name}"]
+        )
+        # Filtro por min_diff
+        dif_sku = sku_merged.loc[sku_merged[f"diff_{bunker_name}_vs_{sap_name}"].abs() >= float(min_diff)]
+        # Orden final
+        sku_cols_order = ["codigo", "descripcion", f"cajas_{sap_name}", f"cajas_{bunker_name}", f"diff_{bunker_name}_vs_{sap_name}"]
+        sku_merged = sku_merged[sku_cols_order].sort_values("codigo").reset_index(drop=True)
+        dif_sku = dif_sku[sku_cols_order].sort_values("codigo").reset_index(drop=True)
+    else:
+        # Sin BUNKER
+        sku_merged = sap_sku.rename(columns={f"cajas_{sap_name}": f"cajas_{sap_name}"}).copy()
+        sku_merged["descripcion"] = sku_merged["descripcion"].fillna("")
+        dif_sku = pd.DataFrame(columns=["codigo","descripcion",f"cajas_{sap_name}"])
+
+    # 4) Tablas STORAGE (CBP vs SAP por codigo+storage)
+    cbp_storage_merged = None
+    dif_storage = None
+    if cbp_name and cbp_name in by_name:
+        df_cbp = by_name[cbp_name]
+        sap_storage = _storage_level(df_sap, f"cajas_{sap_name}")
+        cbp_storage = _storage_level(df_cbp, f"cajas_{cbp_name}")
+        st_merged = pd.merge(
+            sap_storage[["codigo", "storage", "descripcion", f"cajas_{sap_name}"]],
+            cbp_storage[["codigo", "storage", f"cajas_{cbp_name}"]],
+            on=["codigo", "storage"],
+            how="outer"
+        )
+        # NaN -> 0 en cajas
+        for c in [f"cajas_{sap_name}", f"cajas_{cbp_name}"]:
+            if c in st_merged.columns:
+                st_merged[c] = st_merged[c].fillna(0)
+        # completar descripcion si falta
+        if "descripcion" not in st_merged.columns:
+            st_merged["descripcion"] = None
+        st_merged["descripcion"] = st_merged["descripcion"].fillna("")
+        # diff cbp vs sap
+        if f"cajas_{cbp_name}" not in st_merged.columns:
+            st_merged[f"cajas_{cbp_name}"] = 0
+        st_merged[f"diff_{cbp_name}_vs_{sap_name}"] = (
+            st_merged[f"cajas_{cbp_name}"] - st_merged[f"cajas_{sap_name}"]
+        )
+        # Filtro por min_diff
+        dif_storage = st_merged.loc[st_merged[f"diff_{cbp_name}_vs_{sap_name}"].abs() >= float(min_diff)]
+        st_cols_order = ["codigo", "descripcion", "storage", f"cajas_{sap_name}", f"cajas_{cbp_name}", f"diff_{cbp_name}_vs_{sap_name}"]
+        cbp_storage_merged = st_merged[st_cols_order].sort_values(["codigo","storage"]).reset_index(drop=True)
+        dif_storage = dif_storage[st_cols_order].sort_values(["codigo","storage"]).reset_index(drop=True)
+    else:
+        cbp_storage_merged = df_sap.rename(columns={"cajas": f"cajas_{sap_name}"}).copy()
+        cbp_storage_merged = cbp_storage_merged[["codigo","descripcion","storage",f"cajas_{sap_name}"]]
+        dif_storage = pd.DataFrame(columns=["codigo","descripcion","storage",f"cajas_{sap_name}"])
+
+    # 5) Resumen
+    resumen = pd.DataFrame([{
+        "maestro": sap_name,
+        "archivo_bunker": bunker_name or "",
+        "archivo_cbp": cbp_name or "",
+        "total_skus": int(len(sku_merged)),
+        "con_diferencias_sku": int(len(dif_sku)),
+        "total_claves_storage": int(len(cbp_storage_merged)),
+        "con_diferencias_storage": int(len(dif_storage)),
+        "umbral_min_diff": float(min_diff),
+    }])
+
+    # 6) Excel con gráfico
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+        resumen.to_excel(writer, sheet_name="Resumen", index=False)
+        dif_sku.to_excel(writer, sheet_name="Dif_SKU_BUNKER_vs_SAP", index=False)
+        dif_storage.to_excel(writer, sheet_name="Dif_STORAGE_SAAD_CBP_vs_SAP", index=False)
+        sku_merged.to_excel(writer, sheet_name="Todo_SKU", index=False)
+        cbp_storage_merged.to_excel(writer, sheet_name="Todo_STORAGE", index=False)
+
+    # Gráfico en Resumen
+    from openpyxl import load_workbook
+    from openpyxl.chart import BarChart, Reference
+    wb = load_workbook(tmp.name)
+    ws = wb["Resumen"]
+    try:
+        # Buscar columnas por nombre
+        hdrs = {ws.cell(row=1, column=col).value: col for col in range(1, 20)}
+        metric_cols = [hdrs.get("con_diferencias_sku"), hdrs.get("con_diferencias_storage")]
+        metric_cols = [c for c in metric_cols if c]
+
+        if metric_cols:
+            chart = BarChart()
+            chart.title = "Diferencias (SKU vs STORAGE)"
+            chart.y_axis.title = "Cantidad"
+            chart.x_axis.title = "Tipo"
+
+            data = Reference(ws, min_col=min(metric_cols), min_row=1, max_col=max(metric_cols), max_row=2)
+            cats = Reference(ws, min_col=min(metric_cols), min_row=1, max_col=max(metric_cols), max_row=1)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.height = 10
+            chart.width = 22
+            ws.add_chart(chart, "H2")
+    except Exception:
+        pass
+
+    wb.save(tmp.name)
+    tmp.seek(0)
+    return StreamingResponse(
+        open(tmp.name, "rb"),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=cruce_hibrido_sap_bunker_cbp.xlsx"}
+    )
