@@ -1,15 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-
-# Excel / CSV / ODS
 pandas==2.2.2
 openpyxl==3.1.5
 xlrd==2.0.1
 pyxlsb==1.0.10
 odfpy==1.4.1
-
-# Subidas (multipart/form-data)
 python-multipart==0.0.9
+XlsxWriter==3.1.9
 
-# Para generar el Excel (.xlsx) en /cruce_excel
-XlsxWriter==3.2.0
