@@ -194,12 +194,29 @@ def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     """
     - Normaliza nombres y aplica alias
+    - Fusiona columnas duplicadas tras el alias
     - Valida columnas mínimas: codigo + storage (obligatorias)
     - Crea columnas opcionales si faltan: cajas=0, descripcion=""
     - Tipifica y agrupa por (codigo, storage) sumando cajas
     """
     df = normalize_df(raw_df)
     df = _alias_columns(df)
+
+    # --- fusionar columnas duplicadas tras el alias (p.ej., dos 'codigo') ---
+    def _coalesce_duplicates(_df: pd.DataFrame, target: str) -> pd.DataFrame:
+        cols = [c for c in _df.columns if c == target]
+        if len(cols) <= 1:
+            return _df
+        s = None
+        for c in cols:
+            s = _df[c] if s is None else s.fillna(_df[c])
+        _df[target] = s
+        # eliminamos las duplicadas dejando solo una
+        _df = _df.drop(columns=cols[1:])
+        return _df
+
+    for _col in ["codigo", "descripcion", "storage", "cajas"]:
+        df = _coalesce_duplicates(df, _col)
 
     # --- columnas mínimas obligatorias ---
     cols_min = {"codigo", "storage"}
@@ -221,6 +238,18 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     if "descripcion" not in df.columns:
         df["descripcion"] = ""
 
+    # --- si por algún motivo quedó un DataFrame en lugar de Serie, colapsarlo ---
+    def _collapse_to_series(_df: pd.DataFrame, col: str) -> pd.DataFrame:
+        val = _df[col]
+        # si por duplicados sigue siendo DataFrame, tomar la primera no nula por fila
+        if isinstance(val, pd.DataFrame):
+            s = val.bfill(axis=1).ffill(axis=1).iloc[:, 0]
+            _df[col] = s
+        return _df
+
+    for _col in ["codigo", "storage", "descripcion", "cajas"]:
+        df = _collapse_to_series(df, _col)
+
     # --- normalización de tipos / limpieza ---
     df["codigo"] = df["codigo"].astype(str).str.strip()
     df["storage"] = df["storage"].astype(str).str.strip()
@@ -230,18 +259,18 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
             return float(str(x).replace(",", "."))
         except Exception:
             return 0.0
-
     df["cajas"] = df["cajas"].map(_to_float)
 
-    # --- quedarnos con columnas clave ---
+    # --- quedarnos con columnas clave y agrupar ---
     df = df[["codigo", "storage", "cajas", "descripcion"]]
-
-    # --- agrupar por clave y sumar cajas; 1ra descripcion no vacía ---
     df = (
-        df.sort_values(["codigo", "storage"])  # para que "first" sea estable
+        df.sort_values(["codigo", "storage"])
           .groupby(["codigo", "storage"], as_index=False)
           .agg({"cajas": "sum", "descripcion": "first"})
     )
+    df["archivo"] = archivo
+    return df
+
 
     df["archivo"] = archivo
     return df
@@ -249,8 +278,6 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
 async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
     if len(files) < 2:
         raise HTTPException(status_code=400, detail="Sube al menos 2 archivos para cruzar.")
-
-    # Leer TODOS con nuestra función que soporta xlsx/xls/csv/ods/xlsb/zip
     cargados = []
     for up in files:
         raw = await up.read()
@@ -264,8 +291,6 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
             raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"No pude procesar '{up.filename}': {str(e)}")
-
-    # Merge OUTER por (codigo, storage)
     merged = None
     for i, (name, df_i) in enumerate(cargados):
         if merged is None:
@@ -277,8 +302,6 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
                 on=["codigo", "storage"],
                 how="outer",
             )
-
-    # Completar descripcion si falta
     if "descripcion" not in merged.columns:
         merged["descripcion"] = None
     for (_, df_i) in cargados[1:]:
@@ -291,13 +314,9 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
                     how="left",
                 )["descripcion"]
             )
-
-    # Rellenar NaN en cajas
     caja_cols = [c for c in merged.columns if c.startswith("cajas_")]
     for c in caja_cols:
         merged[c] = merged[c].fillna(0)
-
-    # Diferencias contra el primer archivo como base
     base_name = cargados[0][0]
     base_col = f"cajas_{base_name}"
     diff_cols = []
