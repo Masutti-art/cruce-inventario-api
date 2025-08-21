@@ -1,10 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 import pandas as pd
-import io, csv, tempfile, os
-
-app = FastAPI(title="Cruce Inventario API", version="3.0.0")
-
+import io
+import csv
+import tempfile  # <<--- ESTE FALTABA
 
 # --------------------- Utilitarios de lectura ---------------------
 
