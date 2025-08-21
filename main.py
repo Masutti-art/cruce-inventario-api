@@ -154,7 +154,6 @@ async def upload(file: UploadFile = File(...)):
         "columnas_detectadas": list(map(str, df.columns))[:30],
         "status": "ok"
     })
-# --------------- Cruce ---------------
 def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -177,14 +176,17 @@ def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
         "storage location": "storage", "storage": "storage", "almacen": "storage",
         "deposito": "storage", "depósito": "storage", "warehouse": "storage",
         "ubicacion": "storage", "ubicación": "storage", "location": "storage",
-        "ubiest": "storage",  # BUNKER
+        "ubiest": "storage",    # BUNKER
+        "emplaza": "storage",   # BUNKER variante nueva
+        "estante": "storage",   # BUNKER variante nueva
+        "columna": "storage",   # BUNKER variante nueva
 
         # --- cantidad (cajas) ---
         "cajas": "cajas", "bultos": "cajas", "bum quantity": "cajas",
         "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas",
         "cant cajas": "cajas", "boxes": "cajas", "box qty": "cajas",
         "cartones": "cajas", "ctns": "cajas",
-        "ubcfisi": "cajas",  # BUNKER
+        "ubcfisi": "cajas",     # BUNKER
     }
 
     # aplicar los alias
@@ -194,29 +196,12 @@ def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     """
     - Normaliza nombres y aplica alias
-    - Fusiona columnas duplicadas tras el alias
     - Valida columnas mínimas: codigo + storage (obligatorias)
     - Crea columnas opcionales si faltan: cajas=0, descripcion=""
     - Tipifica y agrupa por (codigo, storage) sumando cajas
     """
     df = normalize_df(raw_df)
     df = _alias_columns(df)
-
-    # --- fusionar columnas duplicadas tras el alias (p.ej., dos 'codigo') ---
-    def _coalesce_duplicates(_df: pd.DataFrame, target: str) -> pd.DataFrame:
-        cols = [c for c in _df.columns if c == target]
-        if len(cols) <= 1:
-            return _df
-        s = None
-        for c in cols:
-            s = _df[c] if s is None else s.fillna(_df[c])
-        _df[target] = s
-        # eliminamos las duplicadas dejando solo una
-        _df = _df.drop(columns=cols[1:])
-        return _df
-
-    for _col in ["codigo", "descripcion", "storage", "cajas"]:
-        df = _coalesce_duplicates(df, _col)
 
     # --- columnas mínimas obligatorias ---
     cols_min = {"codigo", "storage"}
@@ -238,19 +223,7 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     if "descripcion" not in df.columns:
         df["descripcion"] = ""
 
-    # --- si por algún motivo quedó un DataFrame en lugar de Serie, colapsarlo ---
-    def _collapse_to_series(_df: pd.DataFrame, col: str) -> pd.DataFrame:
-        val = _df[col]
-        # si por duplicados sigue siendo DataFrame, tomar la primera no nula por fila
-        if isinstance(val, pd.DataFrame):
-            s = val.bfill(axis=1).ffill(axis=1).iloc[:, 0]
-            _df[col] = s
-        return _df
-
-    for _col in ["codigo", "storage", "descripcion", "cajas"]:
-        df = _collapse_to_series(df, _col)
-
-    # --- normalización de tipos / limpieza ---
+    # --- tipificación ---
     df["codigo"] = df["codigo"].astype(str).str.strip()
     df["storage"] = df["storage"].astype(str).str.strip()
 
@@ -259,18 +232,16 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
             return float(str(x).replace(",", "."))
         except Exception:
             return 0.0
+
     df["cajas"] = df["cajas"].map(_to_float)
 
-    # --- quedarnos con columnas clave y agrupar ---
+    # --- reordenar y agrupar ---
     df = df[["codigo", "storage", "cajas", "descripcion"]]
     df = (
         df.sort_values(["codigo", "storage"])
           .groupby(["codigo", "storage"], as_index=False)
           .agg({"cajas": "sum", "descripcion": "first"})
     )
-    df["archivo"] = archivo
-    return df
-
 
     df["archivo"] = archivo
     return df
