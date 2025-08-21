@@ -8,5 +8,5 @@ xlrd==1.2.0
 pyxlsb==1.0.10
 odfpy==1.4.1
 
-# Uploads con FastAPI
+# Subidas con FastAPI (multipart/form-data)
 python-multipart==0.0.9
