@@ -1,246 +1,375 @@
-import io
-import tempfile
-from typing import List
-
+from typing import List, Dict, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse
-from openpyxl import load_workbook
-from openpyxl.chart import BarChart, Reference
-from openpyxl.utils import get_column_letter
+import io, zipfile, csv, os
 
-app = FastAPI(title="Cruce Inventario API", version="3.1.0")
+app = FastAPI(title="Cruce Inventario API", version="3.0.0")
 
-# --------------------------
-# Config hojas preferidas
-# --------------------------
 REQUIRED_SHEET = "Comparacion Inventario"
 FALLBACK_SHEETS = ["Comparación Inventario", "Data"]
 
-def _pick_sheet(xl: pd.ExcelFile) -> str:
-    """Selecciona la hoja preferida si existe; si no, la primera."""
+# ---------- CSV ----------
+def sniff_csv_delimiter(sample: bytes) -> str:
+    try:
+        txt = sample.decode("utf-8", errors="ignore")
+        dialect = csv.Sniffer().sniff(txt[:2048], delimiters=[",", ";", "\t", "|"])
+        return dialect.delimiter
+    except Exception:
+        s = sample[:4096].decode("utf-8", errors="ignore")
+        if s.count(";") > s.count(","):
+            return ";"
+        if "\t" in s:
+            return "\t"
+        return ","
+
+def read_csv_like(file_bytes: bytes) -> pd.DataFrame:
+    delim = sniff_csv_delimiter(file_bytes)
+    return pd.read_csv(io.BytesIO(file_bytes), delimiter=delim)
+
+# ---------- Excel helpers ----------
+def pick_sheet_name(xl: pd.ExcelFile) -> str:
     sheets = set(xl.sheet_names)
     if REQUIRED_SHEET in sheets:
         return REQUIRED_SHEET
     for fb in FALLBACK_SHEETS:
         if fb in sheets:
             return fb
-    return xl.sheet_names[0] if xl.sheet_names else None
+    norm_req = " ".join(REQUIRED_SHEET.lower().split())
+    for s in xl.sheet_names:
+        if " ".join(s.lower().split()) == norm_req:
+            return s
+    if xl.sheet_names:
+        return xl.sheet_names[0]
+    raise HTTPException(status_code=400, detail="El archivo Excel no contiene hojas.")
 
-# --------------------------
-# Lectura de archivos
-# --------------------------
-def _read_any_table_bytes(b: bytes) -> pd.DataFrame:
-    """
-    Lee XLSX / XLS / XLSB / CSV a DataFrame.
-    - XLSX: por defecto openpyxl (via pandas)
-    - XLS: xlrd (engine explícito)
-    - XLSB: pyxlsb (engine explícito)
-    - CSV: autodetect estándar de pandas
-    """
-    bio = io.BytesIO(b)
-    header = b[:8]
-
-    # XLSX (OOXML): empieza con "PK"
-    if header.startswith(b"PK"):
-        with pd.ExcelFile(bio) as xl:
-            sheet = _pick_sheet(xl)
-            return pd.read_excel(xl, sheet_name=sheet)
-
-    # XLS (BIFF): magic D0 CF (Compound File)
-    if header[:2] == b"\xD0\xCF":
-        with pd.ExcelFile(bio, engine="xlrd") as xl:
-            sheet = _pick_sheet(xl)
-            return pd.read_excel(xl, sheet_name=sheet, engine="xlrd")
-
-    # XLSB (Excel binario moderno): algunos headers típicos
-    if header.startswith(b"\x09\x08\x10\x00") or header.startswith(b"\x09\x04\x06\x00"):
-        with pd.ExcelFile(bio, engine="pyxlsb") as xl:
-            sheet = _pick_sheet(xl)
-            return pd.read_excel(xl, sheet_name=sheet, engine="pyxlsb")
-
-    # CSV (fallback)
+def read_xlsx(file_bytes: bytes) -> pd.DataFrame:
     try:
-        return pd.read_csv(io.BytesIO(b))
-    except Exception:
-        raise ValueError("Formato no reconocido o archivo corrupto")
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))  # openpyxl por defecto
+        sheet = pick_sheet_name(xl)
+        return pd.read_excel(xl, sheet_name=sheet)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer .xlsx: {str(e)}")
 
-# --------------------------
-# Normalización de columnas
-# --------------------------
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - Nombres a minúscula
-    - Alias -> ['codigo','storage','cajas','descripcion']
-    - Crea 'storage' y/o 'cajas' si faltan
-    """
+def read_xls(file_bytes: bytes) -> pd.DataFrame:
+    try:
+        df_dict = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine="xlrd")
+        sheet = REQUIRED_SHEET if REQUIRED_SHEET in df_dict else None
+        if not sheet:
+            for fb in FALLBACK_SHEETS:
+                if fb in df_dict:
+                    sheet = fb
+                    break
+        if not sheet:
+            sheet = next(iter(df_dict.keys()))
+        return df_dict[sheet]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer .xls: {str(e)}")
+
+def read_xlsb(file_bytes: bytes) -> pd.DataFrame:
+    try:
+        tmp = "/tmp/upload.xlsb"
+        with open(tmp, "wb") as f:
+            f.write(file_bytes)
+        xl = pd.ExcelFile(tmp, engine="pyxlsb")
+        sheet = pick_sheet_name(xl)
+        df = pd.read_excel(xl, sheet_name=sheet, engine="pyxlsb")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return df
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer .xlsb: {str(e)}")
+
+def read_ods(file_bytes: bytes) -> pd.DataFrame:
+    try:
+        df_dict = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine="odf")
+        sheet = REQUIRED_SHEET if REQUIRED_SHEET in df_dict else None
+        if not sheet:
+            for fb in FALLBACK_SHEETS:
+                if fb in df_dict:
+                    sheet = fb
+                    break
+        if not sheet:
+            sheet = next(iter(df_dict.keys()))
+        return df_dict[sheet]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer .ods: {str(e)}")
+
+def read_zip_single_table(file_bytes: bytes) -> pd.DataFrame:
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            candidates = [
+                n for n in zf.namelist()
+                if not n.endswith("/") and n.lower().split(".")[-1] in ("xlsx", "xls", "xlsb", "ods", "csv", "tsv", "txt")
+            ]
+            if len(candidates) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"El .zip debe contener exactamente 1 archivo tabular (encontrados: {len(candidates)}).",
+                )
+            inner = zf.read(candidates[0])
+            return read_any_table(inner, candidates[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"ZIP inválido: {str(e)}")
+
+def read_any_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    ext = filename.lower().split(".")[-1]
+    if ext == "xlsx": return read_xlsx(file_bytes)
+    if ext == "xls":  return read_xls(file_bytes)
+    if ext == "xlsb": return read_xlsb(file_bytes)
+    if ext == "ods":  return read_ods(file_bytes)
+    if ext in ("csv", "tsv", "txt"): return read_csv_like(file_bytes)
+    if ext == "zip":  return read_zip_single_table(file_bytes)
+    try:
+        return read_xlsx(file_bytes)  # último intento
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Extensión no soportada: .{ext}. Usa .xlsx/.xls/.xlsb/.ods/.csv/.tsv/.txt o .zip con 1 archivo."
+        )
+
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+# ---------- Endpoints simples ----------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Archivo demasiado grande (>20MB).")
+    try:
+        df = read_any_table(raw, file.filename or "upload.bin")
+        df = normalize_df(df)
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo procesar el archivo: {str(e)}")
+
+    return JSONResponse({
+        "archivo": file.filename,
+        "filas": int(len(df)),
+        "columnas": int(len(df.columns)),
+        "columnas_detectadas": list(map(str, df.columns))[:80],
+        "status": "ok"
+    })
+
+# ---------- Cruce ----------
+def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     alias = {
-        # codigo
-        "material": "codigo",
-        "codigoproducto": "codigo",
-        "sku": "codigo",
-        "codigo": "codigo",
-        # storage
-        "almacen": "storage",
-        "depósito": "storage",
-        "deposito": "storage",
-        "ubicacion": "storage",
-        "ubicación": "storage",
-        "storage": "storage",
-        # cajas
-        "cajas": "cajas",
-        "bultos": "cajas",
-        "cantidad": "cajas",
-        "qty": "cajas",
-        # descripcion
-        "descripcionmaterial": "descripcion",
-        "descripcion": "descripcion",
-        "descripción": "descripcion",
-        "desc": "descripcion",
+        # --- codigo ---
+        "material": "codigo", "codigo": "codigo", "sku": "codigo", "item": "codigo",
+        "item code": "codigo", "codigo articulo": "codigo", "cod articulo": "codigo",
+        "cod": "codigo", "material code": "codigo", "sap code": "codigo",
+        "ubprod": "codigo",  # BUNKER
+
+        # --- descripcion ---
+        "material description": "descripcion", "description": "descripcion",
+        "descripción": "descripcion", "descripcion": "descripcion",
+        "item name": "descripcion", "product": "descripcion", "producto": "descripcion",
+        "nombre": "descripcion", "itdesc": "descripcion",  # BUNKER
+
+        # --- storage / deposito ---
+        "storage location": "storage", "storage": "storage", "almacen": "storage",
+        "deposito": "storage", "depósito": "storage", "warehouse": "storage",
+        "ubicacion": "storage", "ubicación": "storage", "location": "storage",
+        "ubiest": "storage",  "emplaza": "storage", "estante": "storage",
+        "columna": "storage", "nivel": "storage", "ubcia": "storage",
+
+        # --- cantidad (cajas) ---
+        "cajas": "cajas", "bultos": "cajas", "bum quantity": "cajas",
+        "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas",
+        "cant cajas": "cajas", "boxes": "cajas", "box qty": "cajas",
+        "cartones": "cajas", "ctns": "cajas", "ubcfisi": "cajas",  # BUNKER
     }
+
     df = df.rename(columns=lambda c: alias.get(c, c))
+    return df
 
-    if "codigo" not in df.columns:
-        raise ValueError("Falta la columna obligatoria: 'codigo'")
+def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
+    """
+    - Normaliza y aplica alias
+    - Fusiona duplicados tras alias, colapsa si queda DataFrame
+    - Si falta 'storage', intenta construirlo con columnas relacionadas; si no hay, pone 'N/A'
+    - Valida y completa opcionales
+    - Agrupa por (codigo, storage)
+    """
+    df = normalize_df(raw_df)
+    df = _alias_columns(df)
 
+    # --- fusionar duplicadas "codigo/descripcion/storage/cajas" ---
+    def _coalesce_duplicates(_df: pd.DataFrame, target: str) -> pd.DataFrame:
+        cols = [c for c in _df.columns if c == target]
+        if len(cols) <= 1:
+            return _df
+        s = None
+        for c in cols:
+            s = _df[c] if s is None else s.fillna(_df[c])
+        _df[target] = s
+        _df = _df.drop(columns=cols[1:])
+        return _df
+
+    for _col in ["codigo", "descripcion", "storage", "cajas"]:
+        df = _coalesce_duplicates(df, _col)
+
+    # --- si sigue faltando 'storage', intentar construirlo ---
     if "storage" not in df.columns:
-        df["storage"] = ""
+        # buscar columnas que "huelan" a ubicación
+        cand = [c for c in df.columns if any(k in c for k in (
+            "storage", "almac", "depos", "wareh", "ubic", "ubie", "empla", "estan", "colum", "nivel", "ubci", "loca"
+        ))]
+        if cand:
+            s = None
+            for c in cand:
+                part = df[c].astype(str)
+                part = part.where(~part.str.lower().isin(["none", "nan", ""]), "")
+                s = part if s is None else s.mask(s == "", part, inplace=False)
+                # concatenar cuando ya hay algo y part no está vacío
+                s = s.where(part == "", s + "-" + part)
+            df["storage"] = s.str.strip("-").replace("", "N/A")
+        else:
+            # último recurso: no hay nada relacionado → no frenamos
+            df["storage"] = "N/A"
 
+    # --- columnas mínimas obligatorias ---
+    cols_min = {"codigo", "storage"}
+    if not cols_min.issubset(df.columns):
+        faltan = sorted(list(cols_min - set(df.columns)))
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"El archivo '{archivo}' no contiene columnas mínimas",
+                "faltan": faltan,
+                "esperadas": ["codigo", "storage", "cajas (opcional)", "descripcion (opcional)"],
+                "columnas_detectadas": list(df.columns),
+            },
+        )
+
+    # --- opcionales ---
     if "cajas" not in df.columns:
         df["cajas"] = 0
+    if "descripcion" not in df.columns:
+        df["descripcion"] = ""
 
-    # Orden de columnas
-    cols = ["codigo", "storage", "cajas"]
-    if "descripcion" in df.columns:
-        cols.append("descripcion")
-    return df[cols]
+    # --- colapsar DF→Serie si quedara por duplicados raros ---
+    def _collapse_to_series(_df: pd.DataFrame, col: str) -> pd.DataFrame:
+        val = _df[col]
+        if isinstance(val, pd.DataFrame):
+            s = val.bfill(axis=1).ffill(axis=1).iloc[:, 0]
+            _df[col] = s
+        return _df
 
-# --------------------------
-# Lógica de cruce
-# --------------------------
-def _merge_logic(dfs: dict) -> pd.DataFrame:
-    """
-    - SAP vs CBP => por ['codigo','storage']
-    - SAP vs BUNKER => por ['codigo'] (SAP agregado por codigo)
-    Devuelve un dataframe unificado con todas las comparaciones y columnas diff.
-    """
-    sap = dfs.get("sap")
-    cbp = dfs.get("cbp")
-    bunker = dfs.get("bunker")
+    for _col in ["codigo", "storage", "descripcion", "cajas"]:
+        df = _collapse_to_series(df, _col)
 
-    results = []
+    # --- tipificación ---
+    df["codigo"] = df["codigo"].astype(str).str.strip()
+    df["storage"] = df["storage"].astype(str).str.strip()
 
-    # SAP vs CBP: por codigo + storage
-    if sap is not None and cbp is not None:
-        m = sap.merge(cbp, on=["codigo", "storage"], how="outer", suffixes=("_sap", "_cbp"))
-        m["diff_cbp_vs_sap"] = m["cajas_cbp"].fillna(0) - m["cajas_sap"].fillna(0)
-        results.append(m)
+    def _to_float(x):
+        try:
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return 0.0
+    df["cajas"] = df["cajas"].map(_to_float)
 
-    # SAP vs BUNKER: por codigo (se ignora storage)
-    if sap is not None and bunker is not None:
-        sap_sum = sap.groupby("codigo", as_index=False).agg({"cajas": "sum", "descripcion": "first"})
-        bunk_sum = bunker.groupby("codigo", as_index=False).agg({"cajas": "sum"})
-        m = sap_sum.merge(bunk_sum, on="codigo", how="outer", suffixes=("_sap", "_bunker"))
-        m["storage"] = ""  # columna para consistencia visual
-        m["diff_bunker_vs_sap"] = m["cajas_bunker"].fillna(0) - m["cajas_sap"].fillna(0)
-        results.append(m)
+    # --- columnas y agrupación ---
+    df = df[["codigo", "storage", "cajas", "descripcion"]]
+    df = (
+        df.sort_values(["codigo", "storage"])
+          .groupby(["codigo", "storage"], as_index=False)
+          .agg({"cajas": "sum", "descripcion": "first"})
+    )
+    df["archivo"] = archivo
+    return df
 
-    if not results:
-        raise ValueError("No hay suficientes archivos válidos para comparar (se necesitan SAP + CBP o SAP + BUNKER).")
-
-    return pd.concat(results, ignore_index=True, sort=False)
-
-# --------------------------
-# Utilidades Excel
-# --------------------------
-def _autosize_columns(wb):
-    """Auto‑ajuste de anchos en todas las hojas."""
-    for ws in wb.worksheets:
-        for col in ws.columns:
-            max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 2, 60)
-
-def _add_chart(wb):
-    """Grafico de barras con última columna diff en hoja Resumen (si existe Diferencias)."""
-    if "Resumen" not in wb.sheetnames or "Diferencias" not in wb.sheetnames:
-        return
-    ws_diff = wb["Diferencias"]
-    ws_res = wb["Resumen"]
-    if ws_diff.max_row <= 1:
-        return
-    # Tomar la última columna (asumimos que es una diff)
-    last_col = ws_diff.max_column
-    data = Reference(ws_diff, min_col=last_col, min_row=1, max_row=ws_diff.max_row)
-    chart = BarChart()
-    chart.add_data(data, titles_from_data=True)
-    chart.title = "Diferencias (última columna)"
-    ws_res.add_chart(chart, "E5")
-
-# --------------------------
-# Endpoint
-# --------------------------
 @app.post("/cruce")
-async def cruce(files: List[UploadFile] = File(...)):
-    try:
-        dfs = {}
-        for f in files:
-            name = (f.filename or "").lower()
-            raw = await f.read()
-            df = _normalize_df(_read_any_table_bytes(raw))
+async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Sube al menos 2 archivos para cruzar.")
 
-            # Detectar origen por nombre de archivo
-            if "sap" in name:
-                dfs["sap"] = df
-            elif "cbp" in name:
-                dfs["cbp"] = df
-            elif "bunker" in name:
-                dfs["bunker"] = df
+    cargados = []
+    for up in files:
+        raw = await up.read()
+        try:
+            base_name = (up.filename or "archivo").rsplit(".", 1)[0]
+            df_raw = read_any_table(raw, up.filename or "upload.bin")
+            df_pre = _prepare_input_df(df_raw, up.filename or base_name)
+            df_pre = df_pre.rename(columns={"cajas": f"cajas_{base_name}"})
+            cargados.append((base_name, df_pre))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"No pude procesar '{up.filename}': {str(e)}")
 
-        merged = _merge_logic(dfs)
+    # merge por clave
+    merged = None
+    for name, df_i in cargados:
+        if merged is None:
+            merged = df_i
+        else:
+            merged = pd.merge(
+                merged,
+                df_i[["codigo", "storage", f"cajas_{name}"]],
+                on=["codigo", "storage"],
+                how="outer",
+            )
 
-        # Resumen
-        diff_cols = [c for c in merged.columns if c.startswith("diff_")]
-        df_dif = merged.loc[(merged[diff_cols] != 0).any(axis=1)] if diff_cols else merged.copy()
-        resumen = {
-            "total_claves": int(len(merged)),
-            "con_diferencias": int(len(df_dif)),
-            "sin_diferencias": int(len(merged) - len(df_dif)),
-        }
+    # completar descripcion si falta
+    if "descripcion" not in merged.columns:
+        merged["descripcion"] = None
+    for _, df_i in cargados[1:]:
+        if "descripcion" in df_i.columns:
+            merged["descripcion"] = merged["descripcion"].fillna(
+                pd.merge(
+                    merged[["codigo", "storage"]],
+                    df_i[["codigo", "storage", "descripcion"]],
+                    on=["codigo", "storage"],
+                    how="left",
+                )["descripcion"]
+            )
 
-        # Excel temporal
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-        tmp_name = tmp.name
-        tmp.close()
+    # NaN en cajas → 0
+    caja_cols = [c for c in merged.columns if c.startswith("cajas_")]
+    for c in caja_cols:
+        merged[c] = merged[c].fillna(0)
 
-        with pd.ExcelWriter(tmp_name, engine="openpyxl") as writer:
-            pd.DataFrame([resumen]).to_excel(writer, sheet_name="Resumen", index=False)
-            df_dif.to_excel(writer, sheet_name="Diferencias", index=False)
-            merged.to_excel(writer, sheet_name="Todo", index=False)
+    # diferencias vs. primer archivo como base
+    base_name = cargados[0][0]
+    base_col = f"cajas_{base_name}"
+    diff_cols: List[str] = []
+    for name, _ in cargados[1:]:
+        col = f"cajas_{name}"
+        dcol = f"diff_{name}_vs_{base_name}"
+        merged[dcol] = merged[col] - merged[base_col]
+        diff_cols.append(dcol)
 
-            # Totales por storage si aplica
-            if "storage" in merged.columns:
-                caja_cols = [c for c in merged.columns if c.startswith("cajas_")]
-                if caja_cols:
-                    tot = merged.groupby(["storage"], as_index=False)[caja_cols].sum()
-                    tot.to_excel(writer, sheet_name="Totales_por_storage", index=False)
+    diffs_only = merged.loc[(merged[diff_cols] != 0).any(axis=1)] if diff_cols else merged.copy()
+    resumen = {
+        "archivos": [n for (n, _) in cargados],
+        "total_claves": int(len(merged)),
+        "con_diferencias": int(len(diffs_only)),
+        "sin_diferencias": int(len(merged) - len(diffs_only)),
+    }
 
-        # Post-procesamiento con openpyxl
-        wb = load_workbook(tmp_name)
-        _autosize_columns(wb)
-        _add_chart(wb)
-        wb.save(tmp_name)
+    cols_order = ["codigo", "descripcion", "storage"] + caja_cols + diff_cols
+    merged = merged[cols_order].sort_values(["codigo", "storage"]).reset_index(drop=True)
+    diffs_only = diffs_only[cols_order].sort_values(["codigo", "storage"]).reset_index(drop=True)
 
-        return FileResponse(
-            tmp_name,
-            filename="reporte_cruce.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"detail": str(e)})
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    return {
+        "resumen": resumen,
+        "diferencias": diffs_only.to_dict(orient="records"),
+        "todo": merged.to_dict(orient="records"),
+    }
