@@ -159,7 +159,7 @@ async def upload(file: UploadFile = File(...)):
         "archivo": file.filename,
         "filas": int(len(df)),
         "columnas": int(len(df.columns)),
-        "columnas_detectadas": list(map(str, df.columns))[:50],
+        "columnas_detectadas": list(map(str, df.columns))[:80],
         "status": "ok"
     })
 
@@ -179,26 +179,20 @@ def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
         "material description": "descripcion", "description": "descripcion",
         "descripción": "descripcion", "descripcion": "descripcion",
         "item name": "descripcion", "product": "descripcion", "producto": "descripcion",
-        "nombre": "descripcion",
-        "itdesc": "descripcion",  # BUNKER
+        "nombre": "descripcion", "itdesc": "descripcion",  # BUNKER
 
         # --- storage / deposito ---
         "storage location": "storage", "storage": "storage", "almacen": "storage",
         "deposito": "storage", "depósito": "storage", "warehouse": "storage",
         "ubicacion": "storage", "ubicación": "storage", "location": "storage",
-        "ubiest": "storage",     # BUNKER
-        "emplaza": "storage",    # BUNKER variante
-        "estante": "storage",    # BUNKER variante
-        "columna": "storage",    # BUNKER variante
-        "nivel": "storage",      # BUNKER variante NUEVA (detectada)
-        "ubcia": "storage",      # BUNKER variante NUEVA (detectada)
+        "ubiest": "storage",  "emplaza": "storage", "estante": "storage",
+        "columna": "storage", "nivel": "storage", "ubcia": "storage",
 
         # --- cantidad (cajas) ---
         "cajas": "cajas", "bultos": "cajas", "bum quantity": "cajas",
         "qty": "cajas", "cantidad": "cajas", "cantidad cajas": "cajas",
         "cant cajas": "cajas", "boxes": "cajas", "box qty": "cajas",
-        "cartones": "cajas", "ctns": "cajas",
-        "ubcfisi": "cajas",     # BUNKER
+        "cartones": "cajas", "ctns": "cajas", "ubcfisi": "cajas",  # BUNKER
     }
 
     df = df.rename(columns=lambda c: alias.get(c, c))
@@ -206,16 +200,16 @@ def _alias_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     """
-    - Normaliza nombres y aplica alias
-    - Fusiona duplicados tras alias y colapsa si queda DataFrame
-    - Valida columnas mínimas (codigo, storage)
-    - Completa opcionales (cajas=0, descripcion="")
-    - Tipifica y agrupa por (codigo, storage)
+    - Normaliza y aplica alias
+    - Fusiona duplicados tras alias, colapsa si queda DataFrame
+    - Si falta 'storage', intenta construirlo con columnas relacionadas; si no hay, pone 'N/A'
+    - Valida y completa opcionales
+    - Agrupa por (codigo, storage)
     """
     df = normalize_df(raw_df)
     df = _alias_columns(df)
 
-    # fusionar duplicadas "codigo/descripcion/storage/cajas"
+    # --- fusionar duplicadas "codigo/descripcion/storage/cajas" ---
     def _coalesce_duplicates(_df: pd.DataFrame, target: str) -> pd.DataFrame:
         cols = [c for c in _df.columns if c == target]
         if len(cols) <= 1:
@@ -230,7 +224,26 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     for _col in ["codigo", "descripcion", "storage", "cajas"]:
         df = _coalesce_duplicates(df, _col)
 
-    # columnas mínimas
+    # --- si sigue faltando 'storage', intentar construirlo ---
+    if "storage" not in df.columns:
+        # buscar columnas que "huelan" a ubicación
+        cand = [c for c in df.columns if any(k in c for k in (
+            "storage", "almac", "depos", "wareh", "ubic", "ubie", "empla", "estan", "colum", "nivel", "ubci", "loca"
+        ))]
+        if cand:
+            s = None
+            for c in cand:
+                part = df[c].astype(str)
+                part = part.where(~part.str.lower().isin(["none", "nan", ""]), "")
+                s = part if s is None else s.mask(s == "", part, inplace=False)
+                # concatenar cuando ya hay algo y part no está vacío
+                s = s.where(part == "", s + "-" + part)
+            df["storage"] = s.str.strip("-").replace("", "N/A")
+        else:
+            # último recurso: no hay nada relacionado → no frenamos
+            df["storage"] = "N/A"
+
+    # --- columnas mínimas obligatorias ---
     cols_min = {"codigo", "storage"}
     if not cols_min.issubset(df.columns):
         faltan = sorted(list(cols_min - set(df.columns)))
@@ -244,13 +257,13 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
             },
         )
 
-    # opcionales
+    # --- opcionales ---
     if "cajas" not in df.columns:
         df["cajas"] = 0
     if "descripcion" not in df.columns:
         df["descripcion"] = ""
 
-    # si por duplicados quedara DataFrame en vez de Serie, colapsar
+    # --- colapsar DF→Serie si quedara por duplicados raros ---
     def _collapse_to_series(_df: pd.DataFrame, col: str) -> pd.DataFrame:
         val = _df[col]
         if isinstance(val, pd.DataFrame):
@@ -261,7 +274,7 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
     for _col in ["codigo", "storage", "descripcion", "cajas"]:
         df = _collapse_to_series(df, _col)
 
-    # tipificación
+    # --- tipificación ---
     df["codigo"] = df["codigo"].astype(str).str.strip()
     df["storage"] = df["storage"].astype(str).str.strip()
 
@@ -272,7 +285,7 @@ def _prepare_input_df(raw_df: pd.DataFrame, archivo: str) -> pd.DataFrame:
             return 0.0
     df["cajas"] = df["cajas"].map(_to_float)
 
-    # columnas finales y agrupación
+    # --- columnas y agrupación ---
     df = df[["codigo", "storage", "cajas", "descripcion"]]
     df = (
         df.sort_values(["codigo", "storage"])
@@ -301,7 +314,7 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"No pude procesar '{up.filename}': {str(e)}")
 
-    # merge outer por clave
+    # merge por clave
     merged = None
     for name, df_i in cargados:
         if merged is None:
@@ -314,7 +327,7 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
                 how="outer",
             )
 
-    # completar descripcion si falta con la 1ra no nula encontrada
+    # completar descripcion si falta
     if "descripcion" not in merged.columns:
         merged["descripcion"] = None
     for _, df_i in cargados[1:]:
@@ -328,7 +341,7 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
                 )["descripcion"]
             )
 
-    # rellenar NaN en cajas
+    # NaN en cajas → 0
     caja_cols = [c for c in merged.columns if c.startswith("cajas_")]
     for c in caja_cols:
         merged[c] = merged[c].fillna(0)
