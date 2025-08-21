@@ -1,9 +1,16 @@
+from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
+
 import pandas as pd
 import io
 import csv
-import tempfile  # <<--- ESTE FALTABA
+import tempfile  # <<< IMPORTANTE
+import os
+
+app = FastAPI(title="Cruce Inventario API", version="3.0.0")
+
 
 # --------------------- Utilitarios de lectura ---------------------
 
@@ -27,29 +34,18 @@ def _read_any_table_bytes(filename: str, data: bytes) -> pd.DataFrame:
 
     try:
         if ext == "xlsx":
-            # openpyxl por defecto
-            return pd.read_excel(bio)
+            return pd.read_excel(bio)                              # openpyxl
         elif ext == "xls":
-            # requiere pandas<=1.5.3 + xlrd==1.2.0
-            return pd.read_excel(bio, engine="xlrd")
+            return pd.read_excel(bio, engine="xlrd")               # xlrd==1.2.0
         elif ext == "xlsb":
-            # requiere pyxlsb
-            return pd.read_excel(bio, engine="pyxlsb")
+            return pd.read_excel(bio, engine="pyxlsb")             # pyxlsb
         elif ext in ("csv", "tsv", "txt"):
             delim = _sniff_csv_delimiter(data)
             return pd.read_csv(bio, delimiter=delim)
         else:
             # último intento como xlsx
-            try:
-                bio.seek(0)
-                return pd.read_excel(bio)
-            except Exception:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Extensión no soportada: .{ext}. Usa .xlsx/.xls/.xlsb/.csv"
-                )
-    except HTTPException:
-        raise
+            bio.seek(0)
+            return pd.read_excel(bio)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"No pude leer '{filename}': {str(e)}")
 
@@ -74,7 +70,7 @@ ALIASES = {
     "almacén": "storage", "deposito": "storage", "depósito": "storage",
     "warehouse": "storage", "ubicacion": "storage", "ubicación": "storage",
     "location": "storage",
-    "ubiest": "storage",  # BUNKER
+    "ubiest": "storage",                     # BUNKER
     "emplaza": "storage", "estante": "storage", "columna": "storage",  # BUNKER variantes
 
     # --- cantidad (cajas) ---
@@ -111,7 +107,6 @@ def _prepare_df(raw_df: pd.DataFrame, use_storage: bool, archivo: str) -> pd.Dat
 
     df = _normalize_df(raw_df)
 
-    # columnas mínimas
     cols_min = {"codigo"}
     if use_storage:
         cols_min.add("storage")
@@ -129,26 +124,22 @@ def _prepare_df(raw_df: pd.DataFrame, use_storage: bool, archivo: str) -> pd.Dat
         )
 
     if "storage" not in df.columns:
-        # cuando no se usa storage (BUNKER), ponemos vacío para construir la clave
-        df["storage"] = ""
+        df["storage"] = ""  # para clave cuando no se usa storage
 
     if "cajas" not in df.columns:
         df["cajas"] = 0
     if "descripcion" not in df.columns:
         df["descripcion"] = ""
 
-    # tipificación
     df["codigo"] = df["codigo"].astype(str).str.strip()
     df["storage"] = df["storage"].astype(str).str.strip()
     df["cajas"] = df["cajas"].map(_to_float)
 
-    # clave: con o sin storage
     if use_storage:
         df["clave"] = df["codigo"] + "_" + df["storage"]
     else:
         df["clave"] = df["codigo"] + "_"
 
-    # agrupación
     df = (
         df[["clave", "codigo", "storage", "cajas", "descripcion"]]
         .groupby(["clave", "codigo", "storage"], as_index=False)
@@ -165,22 +156,28 @@ def health():
 
 
 @app.post("/cruce")
-async def cruce_archivos(files: list[UploadFile] = File(...)):
+async def cruce_archivos(files: List[UploadFile] = File(...)):
+    """
+    - SAP vs BUNKER: por SKU (ignora storage)
+    - SAP vs CBP: por SKU + storage
+    Devuelve un Excel (Resumen + Diferencias) para descargar.
+    """
     if len(files) < 2:
         raise HTTPException(status_code=400, detail="Sube al menos 2 archivos para cruzar.")
 
-    # Cargar todos los DataFrames en memoria por bytes
-    cargados = {}
+    # Leer todos los archivos primero (por bytes)
+    cargados: dict[str, pd.DataFrame] = {}
     for up in files:
         raw = await up.read()
         if not raw:
             raise HTTPException(status_code=400, detail=f"Archivo vacío: {up.filename}")
         df_raw = _read_any_table_bytes(up.filename, raw)
-        cargados[up.filename] = df_raw
+        cargados[up.filename or f"archivo_{len(cargados)+1}"] = df_raw
 
-    # Identificar archivos por nombre
+    # Detectar por nombre
     def find_file(sub: str):
-        return next((k for k in cargados if sub in k.lower()), None)
+        sub = sub.lower()
+        return next((k for k in cargados if sub in (k or "").lower()), None)
 
     sap_file = find_file("sap")
     bunker_file = find_file("bunker")
@@ -195,18 +192,16 @@ async def cruce_archivos(files: list[UploadFile] = File(...)):
     df_bunker = cargados.get(bunker_file)
     df_cbp = cargados.get(cbp_file)
 
-    # Preparar SAP (usa storage)
+    # SAP usa storage
     df_sap_prep = _prepare_df(df_sap, use_storage=True, archivo=sap_file)
     df_sap_prep = df_sap_prep.rename(columns={"cajas": "cajas_SAP"})
 
-    # Lista de comparaciones
     comparaciones = []
     if df_bunker is not None:
         comparaciones.append(("BUNKER", _prepare_df(df_bunker, use_storage=False, archivo=bunker_file)))
     if df_cbp is not None:
         comparaciones.append(("CBP", _prepare_df(df_cbp, use_storage=True, archivo=cbp_file)))
 
-    # Unir y calcular diferencias
     merged = df_sap_prep.copy()
     diff_cols = []
     caja_cols = ["cajas_SAP"]
@@ -230,7 +225,7 @@ async def cruce_archivos(files: list[UploadFile] = File(...)):
         merged[dcol] = merged[col_i] - merged["cajas_SAP"]
         diff_cols.append(dcol)
 
-    # Descripción: si falta en SAP, traigo la de otras tablas
+    # Descripción de respaldo si faltó en SAP
     if "descripcion" not in merged.columns:
         merged["descripcion"] = None
     for name, df_i in comparaciones:
@@ -258,23 +253,26 @@ async def cruce_archivos(files: list[UploadFile] = File(...)):
         "sin_diferencias": int(total_claves - con_diferencias),
     }
 
-    # Reordenar columnas
+    # Orden columnas
     orden = ["codigo", "descripcion", "storage"] + caja_cols + diff_cols
     merged = merged.reindex(columns=orden).sort_values(["codigo", "storage"]).reset_index(drop=True)
     df_dif = df_dif.reindex(columns=orden).sort_values(["codigo", "storage"]).reset_index(drop=True)
 
     # --------------------- Excel de salida ---------------------
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+    tmp_name = tmp.name
+    tmp.close()
+
+    with pd.ExcelWriter(tmp_name, engine="openpyxl") as writer:
         pd.DataFrame([resumen]).to_excel(writer, sheet_name="Resumen", index=False)
         df_dif.to_excel(writer, sheet_name="Diferencias", index=False)
 
-    # Insertar gráfico simple en Resumen (si algo falla, ignoramos)
+    # Insertar gráfico en Resumen (si falla, lo ignoramos)
     try:
         from openpyxl import load_workbook
         from openpyxl.chart import BarChart, Reference
 
-        wb = load_workbook(tmp.name)
+        wb = load_workbook(tmp_name)
         ws = wb["Resumen"]
 
         # Buscar columnas por nombre
@@ -297,12 +295,20 @@ async def cruce_archivos(files: list[UploadFile] = File(...)):
             chart.width = 22
             ws.add_chart(chart, "H2")
 
-        wb.save(tmp.name)
+        wb.save(tmp_name)
     except Exception:
         pass
 
+    # Borrar el archivo temporal cuando termine la respuesta
+    def _cleanup(path: str):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
     return FileResponse(
-        tmp.name,
+        tmp_name,
         filename="reporte_cruce.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        background=BackgroundTask(_cleanup, tmp_name),
     )
