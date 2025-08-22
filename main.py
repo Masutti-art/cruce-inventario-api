@@ -10,9 +10,15 @@ from pathlib import Path
 app = FastAPI(title="Cruce Inventario API", version="1.0")
 logger = logging.getLogger("uvicorn.error")
 
-# -----------------------
-# Configuración / candidatos de nombres
-# -----------------------
+# =========================
+# 1) Defaults fijos (editá acá si cambian tus encabezados)
+# =========================
+DEFAULT_CODE_COL     = "MATERIAL"      # SKU/código
+DEFAULT_QTY_COL      = "SALDO"         # cantidad (cambiá a "STOCK" si aplica)
+DEFAULT_STORAGE_COL  = "ALMACEN"       # almacén / depósito
+DEFAULT_DESC_COL     = "DESCRIPCION"   # descripción
+
+# Candidatos por si el archivo no trae esos nombres exactos:
 CODE_CANDIDATES = [
     "codigo","cod","sku","material","articulo","item","code",
     "cod_sap","codigo_sap","matnr","referencia","ref",
@@ -30,9 +36,9 @@ QTY_CANDIDATES  = [
     "existencia","existencias","inventario"
 ]
 
-# -----------------------
-# Utilidades
-# -----------------------
+# =========================
+# 2) Utilidades
+# =========================
 def _sanitize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -44,8 +50,7 @@ def _guess_col(df: pd.DataFrame, candidates: List[str], numeric: bool = False) -
     cols = list(df.columns)
     norm = {_sanitize(c): c for c in cols}
     cand = [_sanitize(x) for x in candidates]
-
-    # 1) coincidencia exacta
+    # 1) exacta
     for c in cand:
         if c in norm:
             return norm[c]
@@ -55,7 +60,7 @@ def _guess_col(df: pd.DataFrame, candidates: List[str], numeric: bool = False) -
             if c in k:
                 if not numeric or pd.api.types.is_numeric_dtype(df[orig]):
                     return orig
-    # 3) si piden numérica, tomar la de mayor suma absoluta
+    # 3) si es numérica, elegir la de mayor suma absoluta
     if numeric:
         num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         if num_cols:
@@ -87,21 +92,20 @@ def _read_any_table(file: UploadFile) -> pd.DataFrame:
     try:
         if suffix in (".xls", ".xlsx", ".xlsm"):
             engine = "xlrd" if suffix == ".xls" else "openpyxl"
-            for hdr in range(0, 11):  # prueba header en 0..10
+            for hdr in range(0, 11):  # prueba header 0..10
                 try:
                     df = _read_excel_try(file.file, engine, hdr)
                     if not df.dropna(how="all").empty and len(df.columns) >= 2:
                         return df
                 except Exception:
                     continue
-            # último intento default
             return _read_excel_try(file.file, engine, 0)
         elif suffix in (".csv", ".txt"):
             file.file.seek(0)
             return pd.read_csv(file.file, sep=None, engine="python")
         else:
             file.file.seek(0)
-            return pd.read_excel(file.file)  # que intente con lo que pueda
+            return pd.read_excel(file.file)
     finally:
         try:
             file.file.seek(0)
@@ -115,15 +119,20 @@ def _normalize_df(
     desc_col_override: Optional[str] = None,
     qty_col_override: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Devuelve columnas normalizadas: codigo, storage, descripcion, cajas (agrupadas)."""
+    """
+    Devuelve columnas normalizadas: codigo, storage, descripcion, cajas (agrupadas).
+    Prioridad:
+    1) override (query)
+    2) DEFAULT_* (fijos de arriba)
+    3) candidatos/heurística
+    """
     df = df.dropna(how="all")
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Overrides explícitos tienen prioridad
-    codigo_col  = _find_col_by_name(df, code_col_override) or _guess_col(df, CODE_CANDIDATES)
-    storage_col = _find_col_by_name(df, storage_col_override) or _guess_col(df, STO_CANDIDATES)
-    desc_col    = _find_col_by_name(df, desc_col_override) or _guess_col(df, DESC_CANDIDATES)
-    qty_col     = _find_col_by_name(df, qty_col_override)  or _guess_col(df, QTY_CANDIDATES, numeric=True)
+    codigo_col  = _find_col_by_name(df, code_col_override    or DEFAULT_CODE_COL)     or _guess_col(df, CODE_CANDIDATES)
+    storage_col = _find_col_by_name(df, storage_col_override or DEFAULT_STORAGE_COL)  or _guess_col(df, STO_CANDIDATES)
+    desc_col    = _find_col_by_name(df, desc_col_override    or DEFAULT_DESC_COL)     or _guess_col(df, DESC_CANDIDATES)
+    qty_col     = _find_col_by_name(df, qty_col_override     or DEFAULT_QTY_COL)      or _guess_col(df, QTY_CANDIDATES, numeric=True)
 
     if not codigo_col:
         raise ValueError("No se encontró la columna de CÓDIGO en el archivo.")
@@ -148,10 +157,14 @@ def _maybe_int(v):
     except Exception:
         return v
 
-# -----------------------
-# Núcleo del cruce
-# -----------------------
-async def procesar_cruce(files: List[UploadFile], overrides: dict | None = None) -> Dict:
+# =========================
+# 3) Núcleo del cruce
+# =========================
+async def procesar_cruce(
+    files: List[UploadFile],
+    overrides: dict | None = None,
+    only_storage: Optional[str] = None,
+) -> Dict:
     """Cruza N archivos por (codigo, storage); baseline = primer archivo."""
     overrides = overrides or {}
     if not files or len(files) < 2:
@@ -161,13 +174,18 @@ async def procesar_cruce(files: List[UploadFile], overrides: dict | None = None)
     norm_dfs: List[pd.DataFrame] = []
 
     def _norm(df_raw: pd.DataFrame) -> pd.DataFrame:
-        return _normalize_df(
+        dfn = _normalize_df(
             df_raw,
             code_col_override=overrides.get("code_col"),
             storage_col_override=overrides.get("storage_col"),
             desc_col_override=overrides.get("desc_col"),
             qty_col_override=overrides.get("qty_col"),
         )
+        # Filtro por depósito (opcional)
+        if only_storage:
+            val = only_storage.strip().casefold()
+            dfn = dfn[dfn["storage"].astype(str).str.strip().str.casefold() == val]
+        return dfn
 
     # Leer y normalizar cada archivo
     for f in files:
@@ -231,12 +249,11 @@ async def procesar_cruce(files: List[UploadFile], overrides: dict | None = None)
     }
     return res
 
-# -----------------------
-# Excel builder
-# -----------------------
+# =========================
+# 4) Excel builder
+# =========================
 def _xlsx_from_res(res: Dict) -> bytes:
     df = pd.DataFrame(res.get("diferencias", []))
-
     if df.empty:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
@@ -269,9 +286,9 @@ def _xlsx_from_res(res: Dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# -----------------------
-# Endpoints
-# -----------------------
+# =========================
+# 5) Endpoints
+# =========================
 @app.post("/cruce")
 async def cruce(
     files: List[UploadFile] = File(...),
@@ -279,6 +296,7 @@ async def cruce(
     storage_col: Optional[str] = None,
     desc_col: Optional[str] = None,
     qty_col: Optional[str] = None,
+    only_storage: Optional[str] = None,
 ):
     """Devuelve JSON: resumen + diferencias por clave (codigo, storage)."""
     try:
@@ -288,7 +306,7 @@ async def cruce(
             "desc_col": desc_col,
             "qty_col": qty_col,
         }
-        return await procesar_cruce(files, overrides=overrides)
+        return await procesar_cruce(files, overrides=overrides, only_storage=only_storage)
     except Exception as e:
         logger.exception("Error en /cruce")
         return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
@@ -297,7 +315,7 @@ async def cruce(
     "/cruce-xlsx",
     responses={200: {
         "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
-        "description": "Cruce en Excel (ordenado por mayor diferencia absoluta)",
+        "description": "Cruce en Excel (ordenado ↓ por mayor diferencia absoluta)",
     }},
 )
 async def cruce_xlsx(
@@ -306,8 +324,9 @@ async def cruce_xlsx(
     storage_col: Optional[str] = None,
     desc_col: Optional[str] = None,
     qty_col: Optional[str] = None,
+    only_storage: Optional[str] = None,
 ):
-    """Devuelve un .xlsx: hoja 'Diferencias' (ordenada ↓ por dif_mayor_abs) y hoja 'Resumen'."""
+    """Descarga XLSX con hoja 'Diferencias' (ordenada) y 'Resumen'."""
     try:
         overrides = {
             "code_col": code_col,
@@ -315,7 +334,7 @@ async def cruce_xlsx(
             "desc_col": desc_col,
             "qty_col": qty_col,
         }
-        res = await procesar_cruce(files, overrides=overrides)
+        res = await procesar_cruce(files, overrides=overrides, only_storage=only_storage)
         xlsx_bytes = _xlsx_from_res(res)
         return StreamingResponse(
             io.BytesIO(xlsx_bytes),
