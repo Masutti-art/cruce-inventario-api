@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -7,14 +6,14 @@ import pandas as pd
 import io, re, sys, unicodedata, logging
 from pathlib import Path
 
-app = FastAPI(title="Cruce Inventario API", version="1.0")
+app = FastAPI(title="Cruce Inventario API", version="1.1")
 logger = logging.getLogger("uvicorn.error")
 
 # =========================
-# 1) Defaults fijos (editá acá si cambian tus encabezados)
+# 1) Defaults y candidatos
 # =========================
 DEFAULT_CODE_COL     = "MATERIAL"      # SKU/código
-DEFAULT_QTY_COL      = "SALDO"         # cantidad (cambiá a "STOCK" si aplica)
+DEFAULT_QTY_COL      = "SALDO"         # cantidad
 DEFAULT_STORAGE_COL  = "ALMACEN"       # almacén / depósito
 DEFAULT_DESC_COL     = "DESCRIPCION"   # descripción
 
@@ -86,12 +85,30 @@ def _find_col_by_name(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
             return c
     return None
 
+def _clean_code(x: str) -> Optional[str]:
+    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos → None."""
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "" or s.upper() in {"TOTAL","RESUMEN","SUBTOTAL","NA","N/A","-"}:
+        return None
+    # quitar ceros a izquierda (numéricos o alfanuméricos)
+    s = re.sub(r"^0+(?=[A-Za-z0-9])", "", s)
+    s = s.upper()
+    return s if s else None
+
+def _clean_storage(x: str) -> str:
+    """Normaliza depósito: trim + upper (si viene vacío, queda '')."""
+    if x is None:
+        return ""
+    return str(x).strip().upper()
+
 def _read_excel_try(fobj, engine: str, header) -> pd.DataFrame:
     fobj.seek(0)
     return pd.read_excel(fobj, engine=engine, header=header)
 
 def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.DataFrame:
-    """Lee xls/xlsx/csv/txt. En Excel prueba encabezado en filas 0..30 (o `header_row` si se indica)."""
+    """Lee xls/xlsx/csv/txt. En Excel prueba encabezado en filas 0..30 (o `header_row`)."""
     name = file.filename or "archivo"
     suffix = Path(name).suffix.lower()
     try:
@@ -99,7 +116,6 @@ def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.Da
             engine = "xlrd" if suffix == ".xls" else "openpyxl"
             if header_row is not None:
                 return _read_excel_try(file.file, engine, header_row)
-            # búsqueda amplia de encabezado
             for hdr in range(0, 31):  # 0..30
                 try:
                     df = _read_excel_try(file.file, engine, hdr)
@@ -120,6 +136,9 @@ def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.Da
         except Exception:
             pass
 
+# =========================
+# 3) Normalización de cada archivo
+# =========================
 def _normalize_df(
     df: pd.DataFrame,
     code_col_override: Optional[str] = None,
@@ -128,11 +147,8 @@ def _normalize_df(
     qty_col_override: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Devuelve columnas normalizadas: codigo, storage, descripcion, cajas (agrupadas).
-    Prioridad:
-      1) override (query)
-      2) DEFAULT_* (fijos)
-      3) candidatos/heurística
+    Devuelve columnas: codigo, storage, descripcion, cajas (agrupadas).
+    Limpia códigos, saca vacíos y normaliza almacenamiento.
     """
     df = df.dropna(how="all")
     df.columns = [str(c).strip() for c in df.columns]
@@ -148,25 +164,40 @@ def _normalize_df(
         raise ValueError("No se encontró la columna de CANTIDAD/CAJAS en el archivo.")
 
     out = pd.DataFrame()
-    out["codigo"] = df[codigo_col].astype(str).str.strip()
-    out["storage"] = df[storage_col].astype(str).str.strip() if storage_col else ""
+    out["codigo"] = df[codigo_col].map(_clean_code)
+    out["storage"] = df[storage_col].map(_clean_storage) if storage_col else ""
     out["descripcion"] = df[desc_col].astype(str) if desc_col else ""
     out["cajas"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
+    # sacar filas sin código luego de limpiar
+    out = out.dropna(subset=["codigo"])
+    # agrupar
     out = (
         out.groupby(["codigo", "storage"], as_index=False)
            .agg({"descripcion": "first", "cajas": "sum"})
     )
     return out
 
-def _maybe_int(v):
-    try:
-        return int(v) if float(v).is_integer() else float(v)
-    except Exception:
-        return v
+def _friendly_label(label: str) -> str:
+    U = label.upper()
+    if "SAP" in U:      return "SAP"
+    if "CBP" in U:      return "CBP"
+    if "BUNKER" in U:   return "BUNKER"
+    # fallback corto
+    return re.sub(r"[^A-Z0-9]+", "_", U)[:20].strip("_")
+
+def _looks_bad_desc(s: str) -> bool:
+    """Marca descripciones inútiles (ej. '3 Caj', '-')."""
+    if not s: return True
+    t = str(s).strip().upper()
+    if t in {"-", "NA", "N/A", "NONE"}: return True
+    # patrón tipo '3 CAJ', '1 CAJ', etc.
+    if re.match(r"^\d+\s*\w{2,4}$", t):
+        return True
+    return False
 
 # =========================
-# 3) Núcleo del cruce
+# 4) Motor de cruce
 # =========================
 async def procesar_cruce(
     files: List[UploadFile],
@@ -182,7 +213,12 @@ async def procesar_cruce(
     etiquetas: List[str] = []
     norm_dfs: List[pd.DataFrame] = []
 
-    def _norm(df_raw: pd.DataFrame) -> pd.DataFrame:
+    for f in files:
+        base = Path(f.filename or "archivo").stem
+        label = _friendly_label(base)
+        etiquetas.append(label)
+
+        df_raw = _read_any_table(f, header_row=header_row)
         dfn = _normalize_df(
             df_raw,
             code_col_override=overrides.get("code_col"),
@@ -190,183 +226,33 @@ async def procesar_cruce(
             desc_col_override=overrides.get("desc_col"),
             qty_col_override=overrides.get("qty_col"),
         )
-        # Filtro por depósito (opcional)
+        # filtro por depósito (opcional)
         if only_storage:
-            val = only_storage.strip().casefold()
-            dfn = dfn[dfn["storage"].astype(str).str.strip().str.casefold() == val]
-        return dfn
+            val = only_storage.strip().upper()
+            dfn = dfn[dfn["storage"] == val]
 
-    # Leer y normalizar cada archivo
-    for f in files:
-        base = Path(f.filename or "archivo").stem
-        etiquetas.append(base)
-        df_raw = _read_any_table(f, header_row=header_row)
-        df_norm = _norm(df_raw)
-        norm_dfs.append(df_norm)
+        # renombrar columnas para conservar descripciones por origen
+        dfn = dfn.rename(columns={"cajas": f"cajas_{label}", "descripcion": f"desc_{label}"})
+        norm_dfs.append(dfn)
 
-    # Merge progresivo (outer) por claves
+    # merge progresivo por claves
     base_keys = ["codigo", "storage"]
     merged: Optional[pd.DataFrame] = None
-    for label, nd in zip(etiquetas, norm_dfs):
-        col = f"cajas_{label}"
-        nd = nd.rename(columns={"cajas": col})
+    for nd in norm_dfs:
         merged = nd if merged is None else merged.merge(nd, on=base_keys, how="outer")
 
-    # Unificar descripción: tomar la primera no vacía entre columnas similares
-    desc_cols = [c for c in merged.columns if str(c).startswith("descripcion")]
-    if desc_cols:
-        merged["descripcion"] = merged[desc_cols].bfill(axis=1).iloc[:, 0]
-        drop_cols = [c for c in desc_cols if c != "descripcion"]
-        merged.drop(columns=drop_cols, inplace=True, errors="ignore")
-    else:
-        merged["descripcion"] = ""
-
-    # Rellenar NaN en columnas de cajas
+    # columnas de cajas y descripciones por origen
     cajas_cols = [c for c in merged.columns if c.startswith("cajas_")]
+    desc_cols  = [c for c in merged.columns if c.startswith("desc_")]
+
+    # relleno 0 en cajas
     for c in cajas_cols:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
 
-    # Diffs contra el PRIMER archivo (baseline)
-    baseline = cajas_cols[0]
-    diff_cols: List[str] = []
-    for c in cajas_cols[1:]:
-        diff_name = f"diff_{c.replace('cajas_', '')}_vs_{baseline.replace('cajas_', '')}"
-        merged[diff_name] = merged[c] - merged[baseline]
-        diff_cols.append(diff_name)
-
-    # Métrica para ordenar
-    merged["dif_mayor_abs"] = merged[diff_cols].abs().max(axis=1) if diff_cols else 0
-
-    # Resumen
-    total = int(len(merged))
-    con_dif = int(merged[diff_cols].ne(0).any(axis=1).sum()) if diff_cols else 0
-    sin_dif = int(total - con_dif)
-
-    visibles = ["codigo", "storage", "descripcion"] + cajas_cols + diff_cols
-    merged_vis = merged[visibles].copy()
-    for c in cajas_cols + diff_cols:
-        merged_vis[c] = merged_vis[c].apply(_maybe_int)
-
-    res = {
-        "resumen": {
-            "archivos": etiquetas,
-            "total_claves": total,
-            "con_diferencias": con_dif,
-            "sin_diferencias": sin_dif,
-        },
-        "diferencias": merged_vis.to_dict(orient="records"),
-    }
-    return res
-
-# =========================
-# 4) Excel builder
-# =========================
-def _xlsx_from_res(res: Dict) -> bytes:
-    df = pd.DataFrame(res.get("diferencias", []))
-    if df.empty:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
-            pd.DataFrame([], columns=["sin_datos"]).to_excel(w, "Diferencias", index=False)
-        buf.seek(0)
-        return buf.read()
-
-    diff_cols = [c for c in df.columns if str(c).startswith("diff_")]
-    if diff_cols:
-        df["dif_mayor_abs"] = df[diff_cols].abs().max(axis=1)
-        df = df[df["dif_mayor_abs"] != 0].sort_values("dif_mayor_abs", ascending=False)
-        # Métrica al principio
-        first_cols = ["dif_mayor_abs"]
-        other_cols = [c for c in df.columns if c not in first_cols]
-        df = df[first_cols + other_cols]
-
-    resumen = res.get("resumen", {})
-    resumen_df = pd.DataFrame([{
-        "total_claves": resumen.get("total_claves", 0),
-        "con_diferencias": resumen.get("con_diferencias", 0),
-        "sin_diferencias": resumen.get("sin_diferencias", 0),
-        "archivos": ", ".join(resumen.get("archivos", [])),
-    }])
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df.to_excel(w, sheet_name="Diferencias", index=False)
-        resumen_df.to_excel(w, sheet_name="Resumen", index=False)
-    buf.seek(0)
-    return buf.read()
-
-# =========================
-# 5) Endpoints
-# =========================
-@app.post("/cruce")
-async def cruce(
-    files: List[UploadFile] = File(...),
-    code_col: Optional[str] = None,
-    storage_col: Optional[str] = None,
-    desc_col: Optional[str] = None,
-    qty_col: Optional[str] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-):
-    """Devuelve JSON: resumen + diferencias por clave (codigo, storage)."""
-    try:
-        overrides = {
-            "code_col": code_col,
-            "storage_col": storage_col,
-            "desc_col": desc_col,
-            "qty_col": qty_col,
-        }
-        return await procesar_cruce(
-            files,
-            overrides=overrides,
-            only_storage=only_storage,
-            header_row=header_row,
-        )
-    except Exception as e:
-        logger.exception("Error en /cruce")
-        return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
-
-@app.post(
-    "/cruce-xlsx",
-    responses={200: {
-        "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
-        "description": "Cruce en Excel (ordenado ↓ por mayor diferencia absoluta)",
-    }},
-)
-async def cruce_xlsx(
-    files: List[UploadFile] = File(...),
-    code_col: Optional[str] = None,
-    storage_col: Optional[str] = None,
-    desc_col: Optional[str] = None,
-    qty_col: Optional[str] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-):
-    """Descarga XLSX con hoja 'Diferencias' (ordenada) y 'Resumen'."""
-    try:
-        overrides = {
-            "code_col": code_col,
-            "storage_col": storage_col,
-            "desc_col": desc_col,
-            "qty_col": qty_col,
-        }
-        res = await procesar_cruce(
-            files,
-            overrides=overrides,
-            only_storage=only_storage,
-            header_row=header_row,
-        )
-        xlsx_bytes = _xlsx_from_res(res)
-        return StreamingResponse(
-            io.BytesIO(xlsx_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'}
-        )
-    except Exception as e:
-        logger.exception("Error en /cruce-xlsx")
-        raise HTTPException(status_code=500, detail=f"/cruce-xlsx: {e}")
-
-@app.get("/healthz")
-def healthz():
-    import pandas as _pd
-    return {"ok": True, "python": sys.version.split()[0], "pandas": _pd.__version__}
+    # descripción preferida: SAP > resto que no sea "mala"
+    merged["descripcion"] = ""
+    sap_desc = [c for c in desc_cols if c.upper() == "DESC_SAP"]
+    if sap_desc:
+        merged["descripcion"] = merged[sap_desc[0]].astype(str)
+    # si quedó vacía o mala, buscar otra
+    def _choose_desc(row):
