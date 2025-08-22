@@ -272,4 +272,206 @@ async def procesar_cruce(
     baseline = f"cajas_{baseline_label}"
     diff_cols: List[str] = []
     for lbl in etiquetas:
-        if lbl == baseline
+        if lbl == baseline_label:
+            continue
+        col = f"cajas_{lbl}"
+        if col in merged.columns:
+            dname = f"diff_{lbl}_vs_{baseline_label}"
+            merged[dname] = merged[col] - merged[baseline]
+            diff_cols.append(dname)
+
+    merged["dif_mayor_abs"] = merged[diff_cols].abs().max(axis=1) if diff_cols else 0
+
+    # limpieza final y resumen
+    merged = merged[merged["codigo"].notna() & (merged["codigo"].astype(str).str.strip()!="")]
+    total = int(len(merged))
+    con_dif = int(merged[diff_cols].ne(0).any(axis=1).sum()) if diff_cols else 0
+    sin_dif = int(total - con_dif)
+
+    res = {
+        "resumen": {
+            "archivos": etiquetas,
+            "total_claves": total,
+            "con_diferencias": con_dif,
+            "sin_diferencias": sin_dif,
+        },
+        "diferencias": merged.to_dict(orient="records"),
+    }
+    return res
+
+# ===== Excel: 2 pestañas (CBP vs SAP, BUNKER vs SAP) + Resumen =====
+def _xlsx_from_res(res: Dict) -> bytes:
+    """
+    Genera un XLSX con:
+      - 'SAAD CBP vs SAP'    (codigo, storage, descripcion, 'SAAD CBP', 'SAP COLGATE', 'DIFERENCIA')
+      - 'SAAD BUNKER vs SAP' (codigo, storage, descripcion, 'SAAD BUNKER', 'SAP COLGATE', 'DIFERENCIA')
+      - 'Resumen'
+    Ordenado por |DIFERENCIA| desc en cada pestaña. Sin NaN (0 en números, vacío en textos).
+    """
+    df = pd.DataFrame(res.get("diferencias", []))
+
+    # si no hay datos, libro vacío con hojas
+    if df.empty:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            pd.DataFrame([], columns=["codigo","storage","descripcion","SAAD CBP","SAP COLGATE","DIFERENCIA"]).to_excel(
+                w, "SAAD CBP vs SAP", index=False
+            )
+            pd.DataFrame([], columns=["codigo","storage","descripcion","SAAD BUNKER","SAP COLGATE","DIFERENCIA"]).to_excel(
+                w, "SAAD BUNKER vs SAP", index=False
+            )
+            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
+        buf.seek(0)
+        return buf.read()
+
+    cols = list(df.columns)
+
+    def _find_cajas(tag: str) -> Optional[str]:
+        exact = f"cajas_{tag}"
+        if exact in cols:
+            return exact
+        tagU = tag.upper()
+        for c in cols:
+            if c.startswith("cajas_") and tagU in c.upper():
+                return c
+        return None
+
+    col_sap    = _find_cajas("SAP")
+    col_cbp    = _find_cajas("CBP")
+    col_bunker = _find_cajas("BUNKER")
+
+    base_cols = [c for c in ["codigo", "storage", "descripcion"] if c in df.columns]
+
+    # numéricas a 0
+    for c in [col for col in [col_sap, col_cbp, col_bunker] if col is not None]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    # textos sin NaN
+    for c in ["codigo","storage","descripcion"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).replace({"nan": "", "NaN": ""}).fillna("")
+
+    # ---------- SAAD CBP vs SAP ----------
+    if (col_cbp is not None) or (col_sap is not None):
+        df_cbp = df.copy()
+        df_cbp["SAAD CBP"]    = df_cbp[col_cbp] if (col_cbp in df_cbp.columns) else 0
+        df_cbp["SAP COLGATE"] = df_cbp[col_sap] if (col_sap in df_cbp.columns) else 0
+        df_cbp["DIFERENCIA"]  = df_cbp["SAAD CBP"] - df_cbp["SAP COLGATE"]
+        out_cbp_cols = base_cols + ["SAAD CBP", "SAP COLGATE", "DIFERENCIA"]
+        df_cbp_out = df_cbp[out_cbp_cols].copy()
+        df_cbp_out = df_cbp_out.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
+    else:
+        df_cbp_out = pd.DataFrame([], columns=base_cols + ["SAAD CBP","SAP COLGATE","DIFERENCIA"])
+
+    # ---------- SAAD BUNKER vs SAP ----------
+    if (col_bunker is not None) or (col_sap is not None):
+        df_bun = df.copy()
+        df_bun["SAAD BUNKER"] = df_bun[col_bunker] if (col_bunker in df_bun.columns) else 0
+        df_bun["SAP COLGATE"] = df_bun[col_sap]    if (col_sap in df_bun.columns)    else 0
+        df_bun["DIFERENCIA"]  = df_bun["SAAD BUNKER"] - df_bun["SAP COLGATE"]
+        out_bun_cols = base_cols + ["SAAD BUNKER", "SAP COLGATE", "DIFERENCIA"]
+        df_bun_out = df_bun[out_bun_cols].copy()
+        df_bun_out = df_bun_out.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
+    else:
+        df_bun_out = pd.DataFrame([], columns=base_cols + ["SAAD BUNKER","SAP COLGATE","DIFERENCIA"])
+
+    # Resumen
+    resumen = res.get("resumen", {})
+    resumen_df = pd.DataFrame([{
+        "total_claves": resumen.get("total_claves", 0),
+        "con_diferencias": resumen.get("con_diferencias", 0),
+        "sin_diferencias": resumen.get("sin_diferencias", 0),
+        "archivos": ", ".join(resumen.get("archivos", [])),
+    }])
+
+    # escribir Excel
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        df_cbp_out.to_excel(w, sheet_name="SAAD CBP vs SAP", index=False)
+        df_bun_out.to_excel(w, sheet_name="SAAD BUNKER vs SAP", index=False)
+        resumen_df.to_excel(w, sheet_name="Resumen", index=False)
+
+        # Ancho de columnas
+        for sht in ["SAAD CBP vs SAP", "SAAD BUNKER vs SAP"]:
+            try:
+                ws = w.sheets[sht]
+                ws.set_column(0, 0, 18)  # codigo
+                ws.set_column(1, 1, 10)  # storage
+                ws.set_column(2, 2, 40)  # descripcion
+                ws.set_column(3, 5, 16)  # números
+            except Exception:
+                pass
+
+    buf.seek(0)
+    return buf.read()
+
+# ===== Endpoints =====
+@app.post("/cruce")
+async def cruce(
+    files: List[UploadFile] = File(...),
+    code_col: Optional[str] = None,
+    storage_col: Optional[str] = None,
+    desc_col: Optional[str] = None,
+    qty_col: Optional[str] = None,
+    only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
+):
+    try:
+        overrides = {
+            "code_col": code_col,
+            "storage_col": storage_col,
+            "desc_col": desc_col,
+            "qty_col": qty_col,
+        }
+        return await procesar_cruce(
+            files,
+            overrides=overrides,
+            only_storage=only_storage,
+            header_row=header_row,
+        )
+    except Exception as e:
+        logger.exception("Error en /cruce")
+        return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
+
+@app.post(
+    "/cruce-xlsx",
+    responses={200: {
+        "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+        "description": "Cruce en Excel (dos pestañas: SAAD CBP vs SAP / SAAD BUNKER vs SAP)",
+    }},
+)
+async def cruce_xlsx(
+    files: List[UploadFile] = File(...),
+    code_col: Optional[str] = None,
+    storage_col: Optional[str] = None,
+    desc_col: Optional[str] = None,
+    qty_col: Optional[str] = None,
+    only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
+):
+    try:
+        overrides = {
+            "code_col": code_col,
+            "storage_col": storage_col,
+            "desc_col": desc_col,
+            "qty_col": qty_col,
+        }
+        res = await procesar_cruce(
+            files,
+            overrides=overrides,
+            only_storage=only_storage,
+            header_row=header_row,
+        )
+        xlsx_bytes = _xlsx_from_res(res)
+        return StreamingResponse(
+            io.BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'}
+        )
+    except Exception as e:
+        logger.exception("Error en /cruce-xlsx")
+        raise HTTPException(status_code=500, detail=f"/cruce-xlsx: {e}")
+
+@app.get("/healthz")
+def healthz():
+    import pandas as _pd
+    return {"ok": True, "python": sys.version.split()[0], "pandas": _pd.__version__}
