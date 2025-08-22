@@ -1,48 +1,48 @@
 from __future__ import annotations
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import List, Optional, Dict
-import pandas as pd
-import io, re, sys, unicodedata, logging
+import io
+import logging
+import re
+import sys
+import unicodedata
 from pathlib import Path
+from typing import Dict, List, Optional
 
-app = FastAPI(title="Cruce Inventario API", version="1.1")
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
+
+app = FastAPI(title="Cruce Inventario API", version="1.1.1")
 logger = logging.getLogger("uvicorn.error")
 
-# =========================
-# 1) Defaults y candidatos
-# =========================
-DEFAULT_CODE_COL     = "MATERIAL"      # SKU/código
-DEFAULT_QTY_COL      = "SALDO"         # cantidad
-DEFAULT_STORAGE_COL  = "ALMACEN"       # almacén / depósito
-DEFAULT_DESC_COL     = "DESCRIPCION"   # descripción
+# ===== Defaults y candidatos (Bunker/CBP + SAP) =====
+DEFAULT_CODE_COL = "MATERIAL"       # SKU/código
+DEFAULT_QTY_COL = "SALDO"           # cantidad
+DEFAULT_STORAGE_COL = "ALMACEN"     # almacén / depósito
+DEFAULT_DESC_COL = "DESCRIPCION"    # descripción
 
-# Candidatos ampliados (Bunker/CBP + SAP)
 CODE_CANDIDATES = [
     "codigo","cod","sku","material","articulo","item","code",
     "cod_sap","codigo_sap","matnr","referencia","ref","nro_material","num_material",
     "ubprod"  # Bunker/CBP
 ]
-STO_CANDIDATES  = [
+STO_CANDIDATES = [
     "storage","almacen","almacén","dep","deposito","bodega","warehouse",
     "ubicacion","location","st","sucursal","planta",
-    "ubiest",              # Bunker/CBP
-    "storage location"     # SAP
+    "ubiest",                # Bunker/CBP
+    "storage location"       # SAP
 ]
 DESC_CANDIDATES = [
     "descripcion","denominacion","denominación","description","desc","nombre","detalle",
-    "material description", # SAP
-    "itdesc"                # Bunker/CBP
+    "material description",  # SAP
+    "itdesc"                 # Bunker/CBP
 ]
-QTY_CANDIDATES  = [
+QTY_CANDIDATES = [
     "cajas","cantidad","qty","stock","unidades","cant","saldo","existencia","existencias","inventario",
-    "ubcstk",        # Bunker/CBP
-    "bum quantity"   # SAP
+    "ubcstk",               # Bunker/CBP
+    "bum quantity"          # SAP
 ]
 
-# =========================
-# 2) Utilidades
-# =========================
+# ===== Utilidades =====
 def _sanitize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -54,21 +54,19 @@ def _guess_col(df: pd.DataFrame, candidates: List[str], numeric: bool = False) -
     cols = list(df.columns)
     norm = {_sanitize(c): c for c in cols}
     cand = [_sanitize(x) for x in candidates]
-    # 1) exacta
+
     for c in cand:
         if c in norm:
             return norm[c]
-    # 2) contiene
     for c in cand:
         for k, orig in norm.items():
             if c in k:
                 if not numeric or pd.api.types.is_numeric_dtype(df[orig]):
                     return orig
-    # 3) si es numérica, elegir la de mayor suma absoluta
     if numeric:
         num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         if num_cols:
-            sums = (df[num_cols].abs().sum(numeric_only=True)).sort_values(ascending=False)
+            sums = df[num_cols].abs().sum(numeric_only=True).sort_values(ascending=False)
             if len(sums) > 0:
                 return str(sums.index[0])
     return None
@@ -86,19 +84,17 @@ def _find_col_by_name(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
     return None
 
 def _clean_code(x: str) -> Optional[str]:
-    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos → None."""
+    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos y totales → None."""
     if x is None:
         return None
     s = str(x).strip()
     if s == "" or s.upper() in {"TOTAL","RESUMEN","SUBTOTAL","NA","N/A","-"}:
         return None
-    # quitar ceros a izquierda (numéricos o alfanuméricos)
     s = re.sub(r"^0+(?=[A-Za-z0-9])", "", s)
     s = s.upper()
     return s if s else None
 
 def _clean_storage(x: str) -> str:
-    """Normaliza depósito: trim + upper (si viene vacío, queda '')."""
     if x is None:
         return ""
     return str(x).strip().upper()
@@ -108,7 +104,7 @@ def _read_excel_try(fobj, engine: str, header) -> pd.DataFrame:
     return pd.read_excel(fobj, engine=engine, header=header)
 
 def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.DataFrame:
-    """Lee xls/xlsx/csv/txt. En Excel prueba encabezado en filas 0..30 (o `header_row`)."""
+    """Lee xls/xlsx/csv/txt. En Excel prueba encabezado 0..30 o usa header_row si se indica."""
     name = file.filename or "archivo"
     suffix = Path(name).suffix.lower()
     try:
@@ -136,9 +132,24 @@ def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.Da
         except Exception:
             pass
 
-# =========================
-# 3) Normalización de cada archivo
-# =========================
+def _looks_bad_desc(s: str) -> bool:
+    if not s:
+        return True
+    t = str(s).strip().upper()
+    if t in {"-", "NA", "N/A", "NONE"}:
+        return True
+    if re.match(r"^\d+\s*\w{2,4}$", t):
+        return True
+    return False
+
+def _friendly_label(label: str) -> str:
+    U = label.upper()
+    if "SAP" in U:    return "SAP"
+    if "CBP" in U:    return "CBP"
+    if "BUNKER" in U: return "BUNKER"
+    return re.sub(r"[^A-Z0-9]+", "_", U)[:20].strip("_")
+
+# ===== Normalización por archivo =====
 def _normalize_df(
     df: pd.DataFrame,
     code_col_override: Optional[str] = None,
@@ -146,10 +157,6 @@ def _normalize_df(
     desc_col_override: Optional[str] = None,
     qty_col_override: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Devuelve columnas: codigo, storage, descripcion, cajas (agrupadas).
-    Limpia códigos, saca vacíos y normaliza almacenamiento.
-    """
     df = df.dropna(how="all")
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -169,43 +176,26 @@ def _normalize_df(
     out["descripcion"] = df[desc_col].astype(str) if desc_col else ""
     out["cajas"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
-    # sacar filas sin código luego de limpiar
     out = out.dropna(subset=["codigo"])
-    # agrupar
     out = (
         out.groupby(["codigo", "storage"], as_index=False)
            .agg({"descripcion": "first", "cajas": "sum"})
     )
     return out
 
-def _friendly_label(label: str) -> str:
-    U = label.upper()
-    if "SAP" in U:      return "SAP"
-    if "CBP" in U:      return "CBP"
-    if "BUNKER" in U:   return "BUNKER"
-    # fallback corto
-    return re.sub(r"[^A-Z0-9]+", "_", U)[:20].strip("_")
+# ===== Motor de cruce =====
+def _maybe_int(v):
+    try:
+        return int(v) if float(v).is_integer() else float(v)
+    except Exception:
+        return v
 
-def _looks_bad_desc(s: str) -> bool:
-    """Marca descripciones inútiles (ej. '3 Caj', '-')."""
-    if not s: return True
-    t = str(s).strip().upper()
-    if t in {"-", "NA", "N/A", "NONE"}: return True
-    # patrón tipo '3 CAJ', '1 CAJ', etc.
-    if re.match(r"^\d+\s*\w{2,4}$", t):
-        return True
-    return False
-
-# =========================
-# 4) Motor de cruce
-# =========================
 async def procesar_cruce(
     files: List[UploadFile],
-    overrides: dict | None = None,
+    overrides: Optional[Dict] = None,
     only_storage: Optional[str] = None,
     header_row: Optional[int] = None,
 ) -> Dict:
-    """Cruza N archivos por (codigo, storage); baseline = primer archivo."""
     overrides = overrides or {}
     if not files or len(files) < 2:
         raise HTTPException(status_code=400, detail="Subí al menos 2 archivos para cruzar.")
@@ -226,33 +216,177 @@ async def procesar_cruce(
             desc_col_override=overrides.get("desc_col"),
             qty_col_override=overrides.get("qty_col"),
         )
-        # filtro por depósito (opcional)
         if only_storage:
             val = only_storage.strip().upper()
             dfn = dfn[dfn["storage"] == val]
 
-        # renombrar columnas para conservar descripciones por origen
         dfn = dfn.rename(columns={"cajas": f"cajas_{label}", "descripcion": f"desc_{label}"})
         norm_dfs.append(dfn)
 
-    # merge progresivo por claves
     base_keys = ["codigo", "storage"]
     merged: Optional[pd.DataFrame] = None
     for nd in norm_dfs:
         merged = nd if merged is None else merged.merge(nd, on=base_keys, how="outer")
 
-    # columnas de cajas y descripciones por origen
     cajas_cols = [c for c in merged.columns if c.startswith("cajas_")]
     desc_cols  = [c for c in merged.columns if c.startswith("desc_")]
-
-    # relleno 0 en cajas
     for c in cajas_cols:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
 
-    # descripción preferida: SAP > resto que no sea "mala"
     merged["descripcion"] = ""
     sap_desc = [c for c in desc_cols if c.upper() == "DESC_SAP"]
     if sap_desc:
         merged["descripcion"] = merged[sap_desc[0]].astype(str)
-    # si quedó vacía o mala, buscar otra
+
     def _choose_desc(row):
+        cur = str(row.get("descripcion","")).strip()
+        if not _looks_bad_desc(cur):
+            return cur
+        for c in desc_cols:
+            val = str(row.get(c,"")).strip()
+            if not _looks_bad_desc(val):
+                return val
+        return cur
+    merged["descripcion"] = merged.apply(_choose_desc, axis=1)
+
+    baseline = cajas_cols[0]
+    diff_cols: List[str] = []
+    for c in cajas_cols[1:]:
+        diff_name = f"diff_{c.replace('cajas_', '')}_vs_{baseline.replace('cajas_', '')}"
+        merged[diff_name] = merged[c] - merged[baseline]
+        diff_cols.append(diff_name)
+
+    merged["dif_mayor_abs"] = merged[diff_cols].abs().max(axis=1) if diff_cols else 0
+
+    prefer = ["codigo", "storage", "descripcion"]
+    def _key(x: str) -> tuple:
+        if x.endswith("BUNKER"): return (0, x)
+        if x.endswith("CBP"):    return (1, x)
+        if x.endswith("SAP"):    return (2, x)
+        return (9, x)
+    cajas_sorted = sorted(cajas_cols, key=_key)
+
+    final_cols = prefer + cajas_sorted + diff_cols + ["dif_mayor_abs"]
+    merged = merged[final_cols]
+    merged = merged[merged["codigo"].notna() & (merged["codigo"].astype(str).str.strip()!="")]
+
+    total = int(len(merged))
+    con_dif = int(merged[diff_cols].ne(0).any(axis=1).sum()) if diff_cols else 0
+    sin_dif = int(total - con_dif)
+
+    res = {
+        "resumen": {
+            "archivos": etiquetas,
+            "total_claves": total,
+            "con_diferencias": con_dif,
+            "sin_diferencias": sin_dif,
+        },
+        "diferencias": merged.to_dict(orient="records"),
+    }
+    return res
+
+# ===== Excel =====
+def _xlsx_from_res(res: Dict) -> bytes:
+    df = pd.DataFrame(res.get("diferencias", []))
+    if df.empty:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
+            pd.DataFrame([], columns=["sin_datos"]).to_excel(w, "Diferencias", index=False)
+        buf.seek(0)
+        return buf.read()
+
+    diff_cols = [c for c in df.columns if str(c).startswith("diff_")]
+    if diff_cols:
+        df["dif_mayor_abs"] = df[diff_cols].abs().max(axis=1)
+        df = df[df["dif_mayor_abs"] != 0].sort_values("dif_mayor_abs", ascending=False)
+        first_cols = ["dif_mayor_abs"]
+        other_cols = [c for c in df.columns if c not in first_cols]
+        df = df[first_cols + other_cols]
+
+    resumen = res.get("resumen", {})
+    resumen_df = pd.DataFrame([{
+        "total_claves": resumen.get("total_claves", 0),
+        "con_diferencias": resumen.get("con_diferencias", 0),
+        "sin_diferencias": resumen.get("sin_diferencias", 0),
+        "archivos": ", ".join(resumen.get("archivos", [])),
+    }])
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        df.to_excel(w, sheet_name="Diferencias", index=False)
+        resumen_df.to_excel(w, sheet_name="Resumen", index=False)
+    buf.seek(0)
+    return buf.read()
+
+# ===== Endpoints =====
+@app.post("/cruce")
+async def cruce(
+    files: List[UploadFile] = File(...),
+    code_col: Optional[str] = None,
+    storage_col: Optional[str] = None,
+    desc_col: Optional[str] = None,
+    qty_col: Optional[str] = None,
+    only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
+):
+    try:
+        overrides = {
+            "code_col": code_col,
+            "storage_col": storage_col,
+            "desc_col": desc_col,
+            "qty_col": qty_col,
+        }
+        return await procesar_cruce(
+            files,
+            overrides=overrides,
+            only_storage=only_storage,
+            header_row=header_row,
+        )
+    except Exception as e:
+        logger.exception("Error en /cruce")
+        return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
+
+@app.post(
+    "/cruce-xlsx",
+    responses={200: {
+        "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+        "description": "Cruce en Excel (ordenado ↓ por mayor diferencia absoluta)",
+    }},
+)
+async def cruce_xlsx(
+    files: List[UploadFile] = File(...),
+    code_col: Optional[str] = None,
+    storage_col: Optional[str] = None,
+    desc_col: Optional[str] = None,
+    qty_col: Optional[str] = None,
+    only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
+):
+    try:
+        overrides = {
+            "code_col": code_col,
+            "storage_col": storage_col,
+            "desc_col": desc_col,
+            "qty_col": qty_col,
+        }
+        res = await procesar_cruce(
+            files,
+            overrides=overrides,
+            only_storage=only_storage,
+            header_row=header_row,
+        )
+        xlsx_bytes = _xlsx_from_res(res)
+        return StreamingResponse(
+            io.BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'}
+        )
+    except Exception as e:
+        logger.exception("Error en /cruce-xlsx")
+        raise HTTPException(status_code=500, detail=f"/cruce-xlsx: {e}")
+
+@app.get("/healthz")
+def healthz():
+    import pandas as _pd
+    return {"ok": True, "python": sys.version.split()[0], "pandas": _pd.__version__}
