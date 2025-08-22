@@ -1,3 +1,4 @@
+# main.py
 from __future__ import annotations
 import io
 import logging
@@ -11,12 +12,12 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="Cruce Inventario API", version="1.1.1")
+app = FastAPI(title="Cruce Inventario API", version="1.2.0")
 logger = logging.getLogger("uvicorn.error")
 
 # ===== Defaults y candidatos (Bunker/CBP + SAP) =====
 DEFAULT_CODE_COL = "MATERIAL"       # SKU/código
-DEFAULT_QTY_COL = "SALDO"           # cantidad
+DEFAULT_QTY_COL = "SALDO"           # cantidad (si no está, se detecta "BUM Quantity" por candidatos)
 DEFAULT_STORAGE_COL = "ALMACEN"     # almacén / depósito
 DEFAULT_DESC_COL = "DESCRIPCION"    # descripción
 
@@ -54,15 +55,17 @@ def _guess_col(df: pd.DataFrame, candidates: List[str], numeric: bool = False) -
     cols = list(df.columns)
     norm = {_sanitize(c): c for c in cols}
     cand = [_sanitize(x) for x in candidates]
-
+    # exacta
     for c in cand:
         if c in norm:
             return norm[c]
+    # contiene
     for c in cand:
         for k, orig in norm.items():
             if c in k:
                 if not numeric or pd.api.types.is_numeric_dtype(df[orig]):
                     return orig
+    # numérica más “fuerte”
     if numeric:
         num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         if num_cols:
@@ -84,7 +87,7 @@ def _find_col_by_name(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
     return None
 
 def _clean_code(x: str) -> Optional[str]:
-    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos y totales → None."""
+    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos/totales → None."""
     if x is None:
         return None
     s = str(x).strip()
@@ -138,7 +141,7 @@ def _looks_bad_desc(s: str) -> bool:
     t = str(s).strip().upper()
     if t in {"-", "NA", "N/A", "NONE"}:
         return True
-    if re.match(r"^\d+\s*\w{2,4}$", t):
+    if re.match(r"^\d+\s*\w{2,4}$", t):  # ej. "3 CAJ"
         return True
     return False
 
@@ -176,20 +179,22 @@ def _normalize_df(
     out["descripcion"] = df[desc_col].astype(str) if desc_col else ""
     out["cajas"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
+    # sacar filas sin código después de limpiar
     out = out.dropna(subset=["codigo"])
+    # agrupar por clave
     out = (
         out.groupby(["codigo", "storage"], as_index=False)
            .agg({"descripcion": "first", "cajas": "sum"})
     )
     return out
 
-# ===== Motor de cruce =====
 def _maybe_int(v):
     try:
         return int(v) if float(v).is_integer() else float(v)
     except Exception:
         return v
 
+# ===== Motor de cruce =====
 async def procesar_cruce(
     files: List[UploadFile],
     overrides: Optional[Dict] = None,
@@ -205,7 +210,7 @@ async def procesar_cruce(
 
     for f in files:
         base = Path(f.filename or "archivo").stem
-        label = _friendly_label(base)
+        label = _friendly_label(base)  # → "BUNKER" / "CBP" / "SAP" / otro
         etiquetas.append(label)
 
         df_raw = _read_any_table(f, header_row=header_row)
@@ -223,20 +228,33 @@ async def procesar_cruce(
         dfn = dfn.rename(columns={"cajas": f"cajas_{label}", "descripcion": f"desc_{label}"})
         norm_dfs.append(dfn)
 
+    # merge progresivo por claves
     base_keys = ["codigo", "storage"]
     merged: Optional[pd.DataFrame] = None
     for nd in norm_dfs:
         merged = nd if merged is None else merged.merge(nd, on=base_keys, how="outer")
 
+    # asegurar numéricas y preparar descripciones
     cajas_cols = [c for c in merged.columns if c.startswith("cajas_")]
     desc_cols  = [c for c in merged.columns if c.startswith("desc_")]
     for c in cajas_cols:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
 
+    # Descripción preferida: SAP > otra “buena”
     merged["descripcion"] = ""
     sap_desc = [c for c in desc_cols if c.upper() == "DESC_SAP"]
     if sap_desc:
         merged["descripcion"] = merged[sap_desc[0]].astype(str)
+
+    def _looks_bad_desc(s: str) -> bool:
+        if not s:
+            return True
+        t = str(s).strip().upper()
+        if t in {"-", "NA", "N/A", "NONE"}:
+            return True
+        if re.match(r"^\d+\s*\w{2,4}$", t):
+            return True
+        return False
 
     def _choose_desc(row):
         cur = str(row.get("descripcion","")).strip()
@@ -249,144 +267,9 @@ async def procesar_cruce(
         return cur
     merged["descripcion"] = merged.apply(_choose_desc, axis=1)
 
-    baseline = cajas_cols[0]
+    # difs internas (baseline SAP si existe)
+    baseline_label = "SAP" if "SAP" in etiquetas else etiquetas[0]
+    baseline = f"cajas_{baseline_label}"
     diff_cols: List[str] = []
-    for c in cajas_cols[1:]:
-        diff_name = f"diff_{c.replace('cajas_', '')}_vs_{baseline.replace('cajas_', '')}"
-        merged[diff_name] = merged[c] - merged[baseline]
-        diff_cols.append(diff_name)
-
-    merged["dif_mayor_abs"] = merged[diff_cols].abs().max(axis=1) if diff_cols else 0
-
-    prefer = ["codigo", "storage", "descripcion"]
-    def _key(x: str) -> tuple:
-        if x.endswith("BUNKER"): return (0, x)
-        if x.endswith("CBP"):    return (1, x)
-        if x.endswith("SAP"):    return (2, x)
-        return (9, x)
-    cajas_sorted = sorted(cajas_cols, key=_key)
-
-    final_cols = prefer + cajas_sorted + diff_cols + ["dif_mayor_abs"]
-    merged = merged[final_cols]
-    merged = merged[merged["codigo"].notna() & (merged["codigo"].astype(str).str.strip()!="")]
-
-    total = int(len(merged))
-    con_dif = int(merged[diff_cols].ne(0).any(axis=1).sum()) if diff_cols else 0
-    sin_dif = int(total - con_dif)
-
-    res = {
-        "resumen": {
-            "archivos": etiquetas,
-            "total_claves": total,
-            "con_diferencias": con_dif,
-            "sin_diferencias": sin_dif,
-        },
-        "diferencias": merged.to_dict(orient="records"),
-    }
-    return res
-
-# ===== Excel =====
-def _xlsx_from_res(res: Dict) -> bytes:
-    df = pd.DataFrame(res.get("diferencias", []))
-    if df.empty:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
-            pd.DataFrame([], columns=["sin_datos"]).to_excel(w, "Diferencias", index=False)
-        buf.seek(0)
-        return buf.read()
-
-    diff_cols = [c for c in df.columns if str(c).startswith("diff_")]
-    if diff_cols:
-        df["dif_mayor_abs"] = df[diff_cols].abs().max(axis=1)
-        df = df[df["dif_mayor_abs"] != 0].sort_values("dif_mayor_abs", ascending=False)
-        first_cols = ["dif_mayor_abs"]
-        other_cols = [c for c in df.columns if c not in first_cols]
-        df = df[first_cols + other_cols]
-
-    resumen = res.get("resumen", {})
-    resumen_df = pd.DataFrame([{
-        "total_claves": resumen.get("total_claves", 0),
-        "con_diferencias": resumen.get("con_diferencias", 0),
-        "sin_diferencias": resumen.get("sin_diferencias", 0),
-        "archivos": ", ".join(resumen.get("archivos", [])),
-    }])
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df.to_excel(w, sheet_name="Diferencias", index=False)
-        resumen_df.to_excel(w, sheet_name="Resumen", index=False)
-    buf.seek(0)
-    return buf.read()
-
-# ===== Endpoints =====
-@app.post("/cruce")
-async def cruce(
-    files: List[UploadFile] = File(...),
-    code_col: Optional[str] = None,
-    storage_col: Optional[str] = None,
-    desc_col: Optional[str] = None,
-    qty_col: Optional[str] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-):
-    try:
-        overrides = {
-            "code_col": code_col,
-            "storage_col": storage_col,
-            "desc_col": desc_col,
-            "qty_col": qty_col,
-        }
-        return await procesar_cruce(
-            files,
-            overrides=overrides,
-            only_storage=only_storage,
-            header_row=header_row,
-        )
-    except Exception as e:
-        logger.exception("Error en /cruce")
-        return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
-
-@app.post(
-    "/cruce-xlsx",
-    responses={200: {
-        "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
-        "description": "Cruce en Excel (ordenado ↓ por mayor diferencia absoluta)",
-    }},
-)
-async def cruce_xlsx(
-    files: List[UploadFile] = File(...),
-    code_col: Optional[str] = None,
-    storage_col: Optional[str] = None,
-    desc_col: Optional[str] = None,
-    qty_col: Optional[str] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-):
-    try:
-        overrides = {
-            "code_col": code_col,
-            "storage_col": storage_col,
-            "desc_col": desc_col,
-            "qty_col": qty_col,
-        }
-        res = await procesar_cruce(
-            files,
-            overrides=overrides,
-            only_storage=only_storage,
-            header_row=header_row,
-        )
-        xlsx_bytes = _xlsx_from_res(res)
-        return StreamingResponse(
-            io.BytesIO(xlsx_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'}
-        )
-    except Exception as e:
-        logger.exception("Error en /cruce-xlsx")
-        raise HTTPException(status_code=500, detail=f"/cruce-xlsx: {e}")
-
-@app.get("/healthz")
-def healthz():
-    import pandas as _pd
-    return {"ok": True, "python": sys.version.split()[0], "pandas": _pd.__version__}
+    for lbl in etiquetas:
+        if lbl == baseline
