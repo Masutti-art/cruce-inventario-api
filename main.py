@@ -12,14 +12,17 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="Cruce Inventario API", version="1.2.0")
+app = FastAPI(title="Cruce Inventario API", version="1.3.0")
 logger = logging.getLogger("uvicorn.error")
 
-# ===== Defaults y candidatos (Bunker/CBP + SAP) =====
-DEFAULT_CODE_COL = "MATERIAL"       # SKU/código
-DEFAULT_QTY_COL = "SALDO"           # cantidad (si no está, se detecta "BUM Quantity" por candidatos)
-DEFAULT_STORAGE_COL = "ALMACEN"     # almacén / depósito
-DEFAULT_DESC_COL = "DESCRIPCION"    # descripción
+# ===== Config básico =====
+# Por ahora consideramos BUNKER = AER. Si luego hay más, los agregamos aquí.
+BUNKER_STORAGES = {"AER"}
+
+DEFAULT_CODE_COL = "MATERIAL"
+DEFAULT_QTY_COL = "SALDO"
+DEFAULT_STORAGE_COL = "ALMACEN"
+DEFAULT_DESC_COL = "DESCRIPCION"
 
 CODE_CANDIDATES = [
     "codigo","cod","sku","material","articulo","item","code",
@@ -65,7 +68,7 @@ def _guess_col(df: pd.DataFrame, candidates: List[str], numeric: bool = False) -
             if c in k:
                 if not numeric or pd.api.types.is_numeric_dtype(df[orig]):
                     return orig
-    # numérica más “fuerte”
+    # numérica “con mayor suma”
     if numeric:
         num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
         if num_cols:
@@ -87,12 +90,13 @@ def _find_col_by_name(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
     return None
 
 def _clean_code(x: str) -> Optional[str]:
-    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos/totales → None."""
+    """Normaliza SKU: quita ceros a la izquierda, trim, upper. Vacíos/totales/NAN → None."""
     if x is None:
         return None
     s = str(x).strip()
-    if s == "" or s.upper() in {"TOTAL","RESUMEN","SUBTOTAL","NA","N/A","-"}:
+    if s == "" or s.upper() in {"TOTAL","RESUMEN","SUBTOTAL","NA","N/A","-","NAN"}:
         return None
+    # si viene 0000123 o 0000ABC → quito ceros a izquierda
     s = re.sub(r"^0+(?=[A-Za-z0-9])", "", s)
     s = s.upper()
     return s if s else None
@@ -179,20 +183,16 @@ def _normalize_df(
     out["descripcion"] = df[desc_col].astype(str) if desc_col else ""
     out["cajas"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
-    # sacar filas sin código después de limpiar
+    # descartar filas sin código (después de limpiar)
     out = out.dropna(subset=["codigo"])
+    out = out[out["codigo"].astype(str).str.strip() != ""]
+
     # agrupar por clave
     out = (
         out.groupby(["codigo", "storage"], as_index=False)
            .agg({"descripcion": "first", "cajas": "sum"})
     )
     return out
-
-def _maybe_int(v):
-    try:
-        return int(v) if float(v).is_integer() else float(v)
-    except Exception:
-        return v
 
 # ===== Motor de cruce =====
 async def procesar_cruce(
@@ -234,27 +234,17 @@ async def procesar_cruce(
     for nd in norm_dfs:
         merged = nd if merged is None else merged.merge(nd, on=base_keys, how="outer")
 
-    # asegurar numéricas y preparar descripciones
+    # asegurar numéricas y descripciones
     cajas_cols = [c for c in merged.columns if c.startswith("cajas_")]
     desc_cols  = [c for c in merged.columns if c.startswith("desc_")]
     for c in cajas_cols:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
 
-    # Descripción preferida: SAP > otra “buena”
+    # Descripción preferida: SAP > otra "buena"
     merged["descripcion"] = ""
     sap_desc = [c for c in desc_cols if c.upper() == "DESC_SAP"]
     if sap_desc:
         merged["descripcion"] = merged[sap_desc[0]].astype(str)
-
-    def _looks_bad_desc(s: str) -> bool:
-        if not s:
-            return True
-        t = str(s).strip().upper()
-        if t in {"-", "NA", "N/A", "NONE"}:
-            return True
-        if re.match(r"^\d+\s*\w{2,4}$", t):
-            return True
-        return False
 
     def _choose_desc(row):
         cur = str(row.get("descripcion","")).strip()
@@ -299,18 +289,19 @@ async def procesar_cruce(
     }
     return res
 
-# ===== Excel: 2 pestañas (CBP vs SAP, BUNKER vs SAP) + Resumen =====
+# ===== Excel: dos pestañas (filtrado por depósito) + Resumen =====
 def _xlsx_from_res(res: Dict) -> bytes:
     """
     Genera un XLSX con:
-      - 'SAAD CBP vs SAP'    (codigo, storage, descripcion, 'SAAD CBP', 'SAP COLGATE', 'DIFERENCIA')
-      - 'SAAD BUNKER vs SAP' (codigo, storage, descripcion, 'SAAD BUNKER', 'SAP COLGATE', 'DIFERENCIA')
+      - 'SAAD CBP vs SAP'    (solo depósitos NO AER)
+      - 'SAAD BUNKER vs SAP' (solo depósitos AER)
       - 'Resumen'
-    Ordenado por |DIFERENCIA| desc en cada pestaña. Sin NaN (0 en números, vacío en textos).
+    Columnas: codigo, storage, descripcion, [SAAD …], SAP COLGATE, DIFERENCIA
+    Ordenado por |DIFERENCIA| desc. Sin NaN (0 en números, vacío en textos).
     """
     df = pd.DataFrame(res.get("diferencias", []))
 
-    # si no hay datos, libro vacío con hojas
+    # Libro vacío si no hay datos
     if df.empty:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
@@ -342,37 +333,37 @@ def _xlsx_from_res(res: Dict) -> bytes:
 
     base_cols = [c for c in ["codigo", "storage", "descripcion"] if c in df.columns]
 
-    # numéricas a 0
+    # numéricas → 0
     for c in [col for col in [col_sap, col_cbp, col_bunker] if col is not None]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     # textos sin NaN
     for c in ["codigo","storage","descripcion"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).replace({"nan": "", "NaN": ""}).fillna("")
+            df[c] = df[c].astype(str).replace({"nan": "", "NaN": "", "NAN": ""}).fillna("")
 
-    # ---------- SAAD CBP vs SAP ----------
-    if (col_cbp is not None) or (col_sap is not None):
-        df_cbp = df.copy()
-        df_cbp["SAAD CBP"]    = df_cbp[col_cbp] if (col_cbp in df_cbp.columns) else 0
-        df_cbp["SAP COLGATE"] = df_cbp[col_sap] if (col_sap in df_cbp.columns) else 0
-        df_cbp["DIFERENCIA"]  = df_cbp["SAAD CBP"] - df_cbp["SAP COLGATE"]
-        out_cbp_cols = base_cols + ["SAAD CBP", "SAP COLGATE", "DIFERENCIA"]
-        df_cbp_out = df_cbp[out_cbp_cols].copy()
+    # -------- SAAD CBP vs SAP (NO AER) --------
+    df_cbp = df.copy()
+    if "storage" in df_cbp.columns:
+        df_cbp = df_cbp[~df_cbp["storage"].isin(BUNKER_STORAGES)]  # excluir AER
+    df_cbp["SAAD CBP"]    = df_cbp[col_cbp] if (col_cbp in df_cbp.columns) else 0
+    df_cbp["SAP COLGATE"] = df_cbp[col_sap] if (col_sap in df_cbp.columns) else 0
+    df_cbp["DIFERENCIA"]  = df_cbp["SAAD CBP"] - df_cbp["SAP COLGATE"]
+    out_cbp_cols = base_cols + ["SAAD CBP", "SAP COLGATE", "DIFERENCIA"]
+    df_cbp_out = df_cbp[out_cbp_cols].copy() if out_cbp_cols else pd.DataFrame()
+    if not df_cbp_out.empty:
         df_cbp_out = df_cbp_out.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
-    else:
-        df_cbp_out = pd.DataFrame([], columns=base_cols + ["SAAD CBP","SAP COLGATE","DIFERENCIA"])
 
-    # ---------- SAAD BUNKER vs SAP ----------
-    if (col_bunker is not None) or (col_sap is not None):
-        df_bun = df.copy()
-        df_bun["SAAD BUNKER"] = df_bun[col_bunker] if (col_bunker in df_bun.columns) else 0
-        df_bun["SAP COLGATE"] = df_bun[col_sap]    if (col_sap in df_bun.columns)    else 0
-        df_bun["DIFERENCIA"]  = df_bun["SAAD BUNKER"] - df_bun["SAP COLGATE"]
-        out_bun_cols = base_cols + ["SAAD BUNKER", "SAP COLGATE", "DIFERENCIA"]
-        df_bun_out = df_bun[out_bun_cols].copy()
+    # -------- SAAD BUNKER vs SAP (solo AER) --------
+    df_bun = df.copy()
+    if "storage" in df_bun.columns:
+        df_bun = df_bun[df_bun["storage"].isin(BUNKER_STORAGES)]  # solo AER
+    df_bun["SAAD BUNKER"] = df_bun[col_bunker] if (col_bunker in df_bun.columns) else 0
+    df_bun["SAP COLGATE"] = df_bun[col_sap]    if (col_sap in df_bun.columns)    else 0
+    df_bun["DIFERENCIA"]  = df_bun["SAAD BUNKER"] - df_bun["SAP COLGATE"]
+    out_bun_cols = base_cols + ["SAAD BUNKER", "SAP COLGATE", "DIFERENCIA"]
+    df_bun_out = df_bun[out_bun_cols].copy() if out_bun_cols else pd.DataFrame()
+    if not df_bun_out.empty:
         df_bun_out = df_bun_out.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
-    else:
-        df_bun_out = pd.DataFrame([], columns=base_cols + ["SAAD BUNKER","SAP COLGATE","DIFERENCIA"])
 
     # Resumen
     resumen = res.get("resumen", {})
@@ -383,14 +374,13 @@ def _xlsx_from_res(res: Dict) -> bytes:
         "archivos": ", ".join(resumen.get("archivos", [])),
     }])
 
-    # escribir Excel
+    # Escribir Excel
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         df_cbp_out.to_excel(w, sheet_name="SAAD CBP vs SAP", index=False)
         df_bun_out.to_excel(w, sheet_name="SAAD BUNKER vs SAP", index=False)
         resumen_df.to_excel(w, sheet_name="Resumen", index=False)
 
-        # Ancho de columnas
         for sht in ["SAAD CBP vs SAP", "SAAD BUNKER vs SAP"]:
             try:
                 ws = w.sheets[sht]
@@ -436,7 +426,7 @@ async def cruce(
     "/cruce-xlsx",
     responses={200: {
         "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
-        "description": "Cruce en Excel (dos pestañas: SAAD CBP vs SAP / SAAD BUNKER vs SAP)",
+        "description": "Cruce en Excel (dos pestañas: SAAD CBP vs SAP / SAAD BUNKER vs SAP, filtrando AER a BUNKER).",
     }},
 )
 async def cruce_xlsx(
