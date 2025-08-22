@@ -373,3 +373,73 @@ async def cruce_archivos(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
         "diferencias": diffs_only.to_dict(orient="records"),
         "todo": merged.to_dict(orient="records"),
     }
+# --- DESCARGA EXCEL ORDENADO ---
+from fastapi import UploadFile, File
+from fastapi.responses import StreamingResponse
+import pandas as pd, io, json
+
+def _xlsx_from_res(res: dict) -> bytes:
+    # DataFrame con las diferencias
+    df = pd.DataFrame(res.get("diferencias", []))
+
+    # Columnas de diferencias (las que empiezan con "diff_")
+    diff_cols = [c for c in df.columns if str(c).startswith("diff_")]
+
+    if df.empty:
+        # Excel vacío pero con hoja Resumen
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
+            pd.DataFrame([], columns=["sin_datos"]).to_excel(w, "Diferencias", index=False)
+        buf.seek(0)
+        return buf.read()
+
+    if not diff_cols:
+        df["dif_mayor_abs"] = 0
+        diff_cols = ["dif_mayor_abs"]
+
+    # métrica para ordenar: mayor diferencia absoluta en la fila
+    df["dif_mayor_abs"] = df[diff_cols].abs().max(axis=1)
+    df = df[df["dif_mayor_abs"] != 0].sort_values("dif_mayor_abs", ascending=False)
+
+    # Resumen
+    resumen = res.get("resumen", {})
+    resumen_df = pd.DataFrame([{
+        "total_claves": resumen.get("total_claves", 0),
+        "con_diferencias": resumen.get("con_diferencias", 0),
+        "sin_diferencias": resumen.get("sin_diferencias", 0),
+        "archivos": ", ".join(resumen.get("archivos", [])),
+    }])
+
+    # Escribir XLSX
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        df.to_excel(w, sheet_name="Diferencias", index=False)
+        resumen_df.to_excel(w, sheet_name="Resumen", index=False)
+    buf.seek(0)
+    return buf.read()
+
+# Swagger verá correctamente que devuelve XLSX:
+@app.post(
+    "/cruce-xlsx",
+    responses={200: {
+        "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+        "description": "Cruce en Excel (ordenado por mayor diferencia)",
+    }},
+)
+async def cruce_xlsx(files: list[UploadFile] = File(...)):
+    # Reutilizamos la lógica de /cruce llamando a la misma función si la tenés,
+    # o (más simple) llamamos al propio endpoint cruce como función si devuelve un dict.
+    res = await cruce(files)   # <- tu endpoint /cruce debe devolver un dict (JSON)
+
+    # Si por algún motivo /cruce devolviera una Response, lo parseamos:
+    if not isinstance(res, dict) and hasattr(res, "body"):
+        res = json.loads(res.body)
+
+    xlsx_bytes = _xlsx_from_res(res)
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'}
+    )
+# --- FIN DESCARGA EXCEL ORDENADO ---
