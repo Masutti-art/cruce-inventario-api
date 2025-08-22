@@ -18,22 +18,27 @@ DEFAULT_QTY_COL      = "SALDO"         # cantidad (cambiá a "STOCK" si aplica)
 DEFAULT_STORAGE_COL  = "ALMACEN"       # almacén / depósito
 DEFAULT_DESC_COL     = "DESCRIPCION"   # descripción
 
-# Candidatos por si el archivo no trae esos nombres exactos:
+# Candidatos ampliados (Bunker/CBP + SAP)
 CODE_CANDIDATES = [
     "codigo","cod","sku","material","articulo","item","code",
-    "cod_sap","codigo_sap","matnr","referencia","ref",
-    "nro_material","num_material"
+    "cod_sap","codigo_sap","matnr","referencia","ref","nro_material","num_material",
+    "ubprod"  # Bunker/CBP
 ]
 STO_CANDIDATES  = [
-    "storage","almacen","almacén","dep","deposito","bodega",
-    "warehouse","ubicacion","location","st","sucursal","planta"
+    "storage","almacen","almacén","dep","deposito","bodega","warehouse",
+    "ubicacion","location","st","sucursal","planta",
+    "ubiest",              # Bunker/CBP
+    "storage location"     # SAP
 ]
 DESC_CANDIDATES = [
-    "descripcion","denominacion","denominación","description","desc","nombre","detalle"
+    "descripcion","denominacion","denominación","description","desc","nombre","detalle",
+    "material description", # SAP
+    "itdesc"                # Bunker/CBP
 ]
 QTY_CANDIDATES  = [
-    "cajas","cantidad","qty","stock","unidades","cant","saldo",
-    "existencia","existencias","inventario"
+    "cajas","cantidad","qty","stock","unidades","cant","saldo","existencia","existencias","inventario",
+    "ubcstk",        # Bunker/CBP
+    "bum quantity"   # SAP
 ]
 
 # =========================
@@ -85,14 +90,17 @@ def _read_excel_try(fobj, engine: str, header) -> pd.DataFrame:
     fobj.seek(0)
     return pd.read_excel(fobj, engine=engine, header=header)
 
-def _read_any_table(file: UploadFile) -> pd.DataFrame:
-    """Lee xls/xlsx/csv/txt. En Excel prueba encabezado en filas 0..10."""
+def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.DataFrame:
+    """Lee xls/xlsx/csv/txt. En Excel prueba encabezado en filas 0..30 (o `header_row` si se indica)."""
     name = file.filename or "archivo"
     suffix = Path(name).suffix.lower()
     try:
         if suffix in (".xls", ".xlsx", ".xlsm"):
             engine = "xlrd" if suffix == ".xls" else "openpyxl"
-            for hdr in range(0, 11):  # prueba header 0..10
+            if header_row is not None:
+                return _read_excel_try(file.file, engine, header_row)
+            # búsqueda amplia de encabezado
+            for hdr in range(0, 31):  # 0..30
                 try:
                     df = _read_excel_try(file.file, engine, hdr)
                     if not df.dropna(how="all").empty and len(df.columns) >= 2:
@@ -122,9 +130,9 @@ def _normalize_df(
     """
     Devuelve columnas normalizadas: codigo, storage, descripcion, cajas (agrupadas).
     Prioridad:
-    1) override (query)
-    2) DEFAULT_* (fijos de arriba)
-    3) candidatos/heurística
+      1) override (query)
+      2) DEFAULT_* (fijos)
+      3) candidatos/heurística
     """
     df = df.dropna(how="all")
     df.columns = [str(c).strip() for c in df.columns]
@@ -164,6 +172,7 @@ async def procesar_cruce(
     files: List[UploadFile],
     overrides: dict | None = None,
     only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
 ) -> Dict:
     """Cruza N archivos por (codigo, storage); baseline = primer archivo."""
     overrides = overrides or {}
@@ -191,7 +200,7 @@ async def procesar_cruce(
     for f in files:
         base = Path(f.filename or "archivo").stem
         etiquetas.append(base)
-        df_raw = _read_any_table(f)
+        df_raw = _read_any_table(f, header_row=header_row)
         df_norm = _norm(df_raw)
         norm_dfs.append(df_norm)
 
@@ -203,14 +212,14 @@ async def procesar_cruce(
         nd = nd.rename(columns={"cajas": col})
         merged = nd if merged is None else merged.merge(nd, on=base_keys, how="outer")
 
-    # Descripción: toma la primera no vacía si hay varias
-    if "descripcion" not in merged.columns:
-        merged["descripcion"] = ""
+    # Unificar descripción: tomar la primera no vacía entre columnas similares
+    desc_cols = [c for c in merged.columns if str(c).startswith("descripcion")]
+    if desc_cols:
+        merged["descripcion"] = merged[desc_cols].bfill(axis=1).iloc[:, 0]
+        drop_cols = [c for c in desc_cols if c != "descripcion"]
+        merged.drop(columns=drop_cols, inplace=True, errors="ignore")
     else:
-        desc_cols = [c for c in merged.columns if c.startswith("descripcion")]
-        if len(desc_cols) > 1:
-            merged["descripcion"] = merged[desc_cols].bfill(axis=1).iloc[:, 0]
-            merged.drop(columns=[c for c in desc_cols if c != "descripcion"], inplace=True)
+        merged["descripcion"] = ""
 
     # Rellenar NaN en columnas de cajas
     cajas_cols = [c for c in merged.columns if c.startswith("cajas_")]
@@ -297,6 +306,7 @@ async def cruce(
     desc_col: Optional[str] = None,
     qty_col: Optional[str] = None,
     only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
 ):
     """Devuelve JSON: resumen + diferencias por clave (codigo, storage)."""
     try:
@@ -306,7 +316,12 @@ async def cruce(
             "desc_col": desc_col,
             "qty_col": qty_col,
         }
-        return await procesar_cruce(files, overrides=overrides, only_storage=only_storage)
+        return await procesar_cruce(
+            files,
+            overrides=overrides,
+            only_storage=only_storage,
+            header_row=header_row,
+        )
     except Exception as e:
         logger.exception("Error en /cruce")
         return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
@@ -325,6 +340,7 @@ async def cruce_xlsx(
     desc_col: Optional[str] = None,
     qty_col: Optional[str] = None,
     only_storage: Optional[str] = None,
+    header_row: Optional[int] = None,
 ):
     """Descarga XLSX con hoja 'Diferencias' (ordenada) y 'Resumen'."""
     try:
@@ -334,7 +350,12 @@ async def cruce_xlsx(
             "desc_col": desc_col,
             "qty_col": qty_col,
         }
-        res = await procesar_cruce(files, overrides=overrides, only_storage=only_storage)
+        res = await procesar_cruce(
+            files,
+            overrides=overrides,
+            only_storage=only_storage,
+            header_row=header_row,
+        )
         xlsx_bytes = _xlsx_from_res(res)
         return StreamingResponse(
             io.BytesIO(xlsx_bytes),
