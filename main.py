@@ -6,13 +6,13 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="Cruce Inventario API", version="1.5.0")
+app = FastAPI(title="Cruce Inventario API", version="2.0.0")
 logger = logging.getLogger("uvicorn.error")
 
 # =========================
@@ -122,13 +122,27 @@ def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.Da
             engine = "xlrd" if suffix == ".xls" else "openpyxl"
             if header_row is not None:
                 return _read_excel_try(file.file, engine, header_row)
+            best_df = None
+            best_score = -1
             for hdr in range(0, 31):
                 try:
                     df = _read_excel_try(file.file, engine, hdr)
-                    if not df.dropna(hoy="all").empty and len(df.columns) >= 2:
-                        return df
+                    if df.empty:
+                        continue
+                    # score por cantidad de códigos detectables
+                    tmp = df.dropna(how="all")
+                    if tmp.empty:
+                        continue
+                    # heurística: cuántos "códigos" reconoce
+                    code_col = _guess_col(df, CODE_CANDIDATES)
+                    score = int(df[code_col].notna().sum()) if code_col else 0
+                    if score > best_score:
+                        best_score = score
+                        best_df = df
                 except Exception:
                     continue
+            if best_df is not None:
+                return best_df
             return _read_excel_try(file.file, engine, 0)
         elif suffix in (".csv", ".txt"):
             file.file.seek(0)
@@ -162,7 +176,7 @@ def _friendly_label(label: str) -> str:
         return "BUNKER"
     return re.sub(r"[^A-Z0-9]+", "_", U)[:20].strip("_")
 
-# ====== PASO B: conversión robusta de cantidades ======
+# ====== Conversión robusta de cantidades ======
 def _parse_qty(val) -> float:
     """
     Convierte cantidades que vienen como texto con separadores
@@ -225,7 +239,6 @@ def _normalize_df(
     out["codigo"] = df[codigo_col].map(_clean_code)
     out["storage"] = df[storage_col].map(_clean_storage) if storage_col else ""
     out["descripcion"] = df[desc_col].astype(str) if desc_col else ""
-    # ====== PASO B aplicado ======
     out["cajas"] = df[qty_col].map(_parse_qty).fillna(0)
 
     # descartar filas sin código
@@ -240,48 +253,74 @@ def _normalize_df(
     return out
 
 # =========================
-# Motor de cruce
+# Clasificación automática
 # =========================
-async def procesar_cruce(
-    files: List[UploadFile],
-    overrides: Optional[Dict] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-    match_mode: str = "code",  # por código como default
+def _classify_label(df: pd.DataFrame, filename: str) -> str:
+    name = (filename or "").lower()
+
+    cols_norm = {_sanitize(c) for c in df.columns}
+
+    has_ubprod = any("ubprod" in c for c in cols_norm)
+    has_ubcstk = any("ubcstk" in c for c in cols_norm)
+    has_ubiest = any("ubiest" in c for c in cols_norm)
+
+    has_material = any("material" in c for c in cols_norm)
+    has_storage_location = any("storage location" in c for c in cols_norm) or any("storage_location" in c for c in cols_norm)
+    has_bum = any("bum quantity" in c for c in cols_norm) or any("quantity" in c for c in cols_norm)
+
+    # Palabras clave del nombre del archivo
+    if "bunker" in name:
+        return "BUNKER"
+    if "cbp" in name:
+        return "CBP"
+    if "sap" in name:
+        return "SAP"
+
+    # Por contenido:
+    if has_ubprod or has_ubcstk or has_ubiest:
+        # decidir CBP vs BUNKER por depósitos
+        st_col = _guess_col(df, STO_CANDIDATES)
+        if st_col:
+            stor = df[st_col].astype(str).str.upper().str.strip()
+            non_empty = stor[stor != ""]
+            if len(non_empty) > 0:
+                share_bunker = (non_empty.isin(BUNKER_STORAGES)).mean()
+                if share_bunker >= 0.5:
+                    return "BUNKER"
+                else:
+                    return "CBP"
+        # fallback
+        return "CBP"
+    if has_material and has_storage_location and has_bum:
+        return "SAP"
+
+    # último intento por nombres
+    if "saad" in name and "bunker" in name:
+        return "BUNKER"
+    if "saad" in name and "cbp" in name:
+        return "CBP"
+    return "SAP"  # mejor baseline
+
+# =========================
+# Motor de cruce común
+# =========================
+def _merge_and_build_result(
+    labelled_dfs: List[Tuple[pd.DataFrame, str]],
+    match_mode: str = "code",
 ) -> Dict:
-    overrides = overrides or {}
-    if not files or len(files) < 2:
-        raise HTTPException(status_code=400, detail="Subí al menos 2 archivos para cruzar.")
+    # normalizar nombres de columnas por label
+    normed = []
+    etiquetas = []
+    for (dfn, lbl) in labelled_dfs:
+        etiquetas.append(lbl)
+        d = dfn.rename(columns={"cajas": f"cajas_{lbl}", "descripcion": f"desc_{lbl}"})
+        normed.append(d)
 
-    etiquetas: List[str] = []
-    norm_dfs: List[pd.DataFrame] = []
-
-    for f in files:
-        base = Path(f.filename or "archivo").stem
-        label = _friendly_label(base)  # SAP / CBP / BUNKER / otro
-        etiquetas.append(label)
-
-        df_raw = _read_any_table(f, header_row=header_row)
-        dfn = _normalize_df(
-            df_raw,
-            code_col_override=overrides.get("code_col"),
-            storage_col_override=overrides.get("storage_col"),
-            desc_col_override=overrides.get("desc_col"),
-            qty_col_override=overrides.get("qty_col"),
-        )
-        if only_storage:
-            val = only_storage.strip().upper()
-            dfn = dfn[dfn["storage"] == val]
-
-        dfn = dfn.rename(columns={"cajas": f"cajas_{label}", "descripcion": f"desc_{label}"})
-        norm_dfs.append(dfn)
-
-    # Clave de cruce
     base_keys = ["codigo", "storage"] if match_mode != "code" else ["codigo"]
 
-    # Si hay cruce por código, consolidamos por archivo
+    # si match_mode='code', consolidar cada DF por código
     prepped = []
-    for nd in norm_dfs:
+    for nd in normed:
         qty_col = [c for c in nd.columns if c.startswith("cajas_")][0]
         desc_col = [c for c in nd.columns if c.startswith("desc_")][0]
         if match_mode == "code":
@@ -292,7 +331,6 @@ async def procesar_cruce(
             })
         prepped.append(nd)
 
-    # Merge progresivo
     merged: Optional[pd.DataFrame] = None
     for nd in prepped:
         merged = nd if merged is None else merged.merge(nd, on=base_keys, how="outer")
@@ -300,54 +338,47 @@ async def procesar_cruce(
     if merged is None or merged.empty:
         return {"resumen": {"archivos": etiquetas, "total_claves": 0, "con_diferencias": 0, "sin_diferencias": 0}, "diferencias": []}
 
-    # Asegurar numéricos
-    cajas_cols = [c for c in merged.columns if c.startswith("cajas_")]
-    desc_cols  = [c for c in merged.columns if c.startswith("desc_")]
-    for c in cajas_cols:
+    # numéricos
+    for c in [c for c in merged.columns if c.startswith("cajas_")]:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
 
-    # Descripción preferida: SAP > primera “buena”
+    # descripción preferida: SAP > otras
     merged["descripcion"] = ""
-    sap_desc = [c for c in desc_cols if c.upper() == "DESC_SAP"]
-    if sap_desc:
-        merged["descripcion"] = merged[sap_desc[0]].astype(str)
+    if "desc_SAP" in merged.columns:
+        merged["descripcion"] = merged["desc_SAP"].astype(str)
 
     def _choose_desc(row):
         cur = str(row.get("descripcion", "")).strip()
         if not _looks_bad_desc(cur):
             return cur
-        for c in desc_cols:
-            val = str(row.get(c, "")).strip()
-            if not _looks_bad_desc(val):
-                return val
+        for c in merged.columns:
+            if c.startswith("desc_"):
+                val = str(row.get(c, "")).strip()
+                if not _looks_bad_desc(val):
+                    return val
         return cur
 
     merged["descripcion"] = merged.apply(_choose_desc, axis=1)
-
-    # Dif. internas: baseline SAP si existe
-    baseline_label = "SAP" if "SAP" in etiquetas else etiquetas[0]
-    baseline = f"cajas_{baseline_label}"
-    diff_cols: List[str] = []
-    for lbl in etiquetas:
-        if lbl == baseline_label:
-            continue
-        col = f"cajas_{lbl}"
-        if col in merged.columns:
-            dname = f"diff_{lbl}_vs_{baseline_label}"
-            merged[dname] = merged[col] - merged[baseline]
-            diff_cols.append(dname)
-
-    merged["dif_mayor_abs"] = merged[diff_cols].abs().max(axis=1) if diff_cols else 0
-
-    # Limpieza final de códigos en blanco
     if "codigo" in merged.columns:
         merged = merged[merged["codigo"].notna() & (merged["codigo"].astype(str).str.strip() != "")]
 
+    # resumen
     total = int(len(merged))
+    # baseline SAP si existe
+    baseline_label = "SAP" if "cajas_SAP" in merged.columns else [c.replace("cajas_", "") for c in merged.columns if c.startswith("cajas_")][0]
+    diff_cols = []
+    for c in [c for c in merged.columns if c.startswith("cajas_")]:
+        lbl = c.replace("cajas_", "")
+        if lbl == baseline_label:
+            continue
+        dname = f"diff_{lbl}_vs_{baseline_label}"
+        merged[dname] = merged[c] - merged[f"cajas_{baseline_label}"]
+        diff_cols.append(dname)
+    merged["dif_mayor_abs"] = merged[diff_cols].abs().max(axis=1) if diff_cols else 0
     con_dif = int(merged[diff_cols].ne(0).any(axis=1).sum()) if diff_cols else 0
     sin_dif = int(total - con_dif)
 
-    res = {
+    return {
         "resumen": {
             "archivos": etiquetas,
             "total_claves": total,
@@ -356,113 +387,81 @@ async def procesar_cruce(
         },
         "diferencias": merged.to_dict(orient="records"),
     }
-    return res
 
 # =========================
 # Excel: dos pestañas + resumen
 # =========================
 def _xlsx_from_res(res: Dict, match_mode: str = "code") -> bytes:
-    """
-    Genera un XLSX con:
-     - 'SAAD CBP vs SAP'    (NO BUNKER_STORAGES)
-     - 'SAAD BUNKER vs SAP' (SOLO BUNKER_STORAGES)
-     - 'Resumen'
-    En match_mode='code': no se muestra 'storage' (se agrupa por código).
-    """
     df = pd.DataFrame(res.get("diferencias", []))
 
-    # Libro vacío si no hay datos
-    if df.empty:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            cols_cbp = ["codigo", "descripcion", "SAAD CBP", "SAP COLGATE", "DIFERENCIA"]
-            cols_bun = ["codigo", "descripcion", "SAAD BUNKER", "SAP COLGATE", "DIFERENCIA"]
-            pd.DataFrame([], columns=cols_cbp).to_excel(w, "SAAD CBP vs SAP", index=False)
-            pd.DataFrame([], columns=cols_bun).to_excel(w, "SAAD BUNKER vs SAP", index=False)
-            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
-        buf.seek(0)
-        return buf.read()
-
-    cols = list(df.columns)
-
-    def _find_cajas(tag: str) -> Optional[str]:
-        exact = f"cajas_{tag}"
-        if exact in cols:
-            return exact
-        tagU = tag.upper()
-        for c in cols:
-            if c.startswith("cajas_") and tagU in c.upper():
-                return c
-        return None
-
-    col_sap    = _find_cajas("SAP")
-    col_cbp    = _find_cajas("CBP")
-    col_bunker = _find_cajas("BUNKER")
-
-    # numéricas a 0
-    for c in [col for col in [col_sap, col_cbp, col_bunker] if col is not None]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-    # textos sin NaN
-    for c in ["codigo", "storage", "descripcion"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).replace({"nan": "", "NaN": "", "NAN": ""}).fillna("")
-
-    # columnas base
-    base_cols = ["codigo", "descripcion"] if match_mode == "code" else ["codigo", "storage", "descripcion"]
-
-    # ----- SAAD CBP vs SAP (NO BUNKER storages) -----
-    df_cbp = df.copy()
-    if "storage" in df_cbp.columns and match_mode != "code":
-        df_cbp = df_cbp[~df_cbp["storage"].isin(BUNKER_STORAGES)]
-    df_cbp["SAAD CBP"]    = df_cbp[col_cbp] if (col_cbp in df_cbp.columns) else 0
-    df_cbp["SAP COLGATE"] = df_cbp[col_sap] if (col_sap in df_cbp.columns) else 0
-    df_cbp["DIFERENCIA"]  = df_cbp["SAAD CBP"] - df_cbp["SAP COLGATE"]
-    out_cbp_cols = base_cols + ["SAAD CBP", "SAP COLGATE", "DIFERENCIA"]
-    df_cbp_out = df_cbp[out_cbp_cols].copy() if out_cbp_cols else pd.DataFrame()
-    if not df_cbp_out.empty:
-        df_cbp_out = df_cbp_out.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
-
-    # ----- SAAD BUNKER vs SAP (SOLO BUNKER storages) -----
-    df_bun = df.copy()
-    if "storage" in df_bun.columns and match_mode != "code":
-        df_bun = df_bun[df_bun["storage"].isin(BUNKER_STORAGES)]
-    df_bun["SAAD BUNKER"] = df_bun[col_bunker] if (col_bunker in df_bun.columns) else 0
-    df_bun["SAP COLGATE"] = df_bun[col_sap]    if (col_sap in df_bun.columns)    else 0
-    df_bun["DIFERENCIA"]  = df_bun["SAAD BUNKER"] - df_bun["SAP COLGATE"]
-    out_bun_cols = base_cols + ["SAAD BUNKER", "SAP COLGATE", "DIFERENCIA"]
-    df_bun_out = df_bun[out_bun_cols].copy() if out_bun_cols else pd.DataFrame()
-    if not df_bun_out.empty:
-        df_bun_out = df_bun_out.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
-
-    # Resumen
-    resumen = res.get("resumen", {})
-    resumen_df = pd.DataFrame([{
-        "total_claves": resumen.get("total_claves", 0),
-        "con_diferencias": resumen.get("con_diferencias", 0),
-        "sin_diferencias": resumen.get("sin_diferencias", 0),
-        "archivos": ", ".join(resumen.get("archivos", [])),
-    }])
-
-    # Escribir Excel
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df_cbp_out.to_excel(w, sheet_name="SAAD CBP vs SAP", index=False)
-        df_bun_out.to_excel(w, sheet_name="SAAD BUNKER vs SAP", index=False)
-        resumen_df.to_excel(w, sheet_name="Resumen", index=False)
+        # si no hay datos, hojas vacías
+        if df.empty:
+            pd.DataFrame(columns=["codigo","descripcion","SAAD CBP","SAP COLGATE","DIFERENCIA"]).to_excel(w, "SAAD CBP vs SAP", index=False)
+            pd.DataFrame(columns=["codigo","descripcion","SAAD BUNKER","SAP COLGATE","DIFERENCIA"]).to_excel(w, "SAAD BUNKER vs SAP", index=False)
+            pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
+            buf.seek(0)
+            return buf.read()
 
-        for sht in ["SAAD CBP vs SAP", "SAAD BUNKER vs SAP"]:
+        cols = list(df.columns)
+        def _find_cajas(tag: str) -> Optional[str]:
+            exact = f"cajas_{tag}"
+            if exact in cols:
+                return exact
+            tagU = tag.upper()
+            for c in cols:
+                if c.startswith("cajas_") and tagU in c.upper():
+                    return c
+            return None
+
+        col_sap    = _find_cajas("SAP")
+        col_cbp    = _find_cajas("CBP")
+        col_bunker = _find_cajas("BUNKER")
+
+        for c in [col for col in [col_sap, col_cbp, col_bunker] if col is not None]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        for c in ["codigo","storage","descripcion"]:
+            if c in df.columns:
+                df[c] = df[c].astype(str).replace({"nan":"", "NaN":"", "NAN":""}).fillna("")
+
+        base_cols = ["codigo","descripcion"] if match_mode=="code" else ["codigo","storage","descripcion"]
+
+        # CBP vs SAP (sin depósitos bunker)
+        df_cbp = df.copy()
+        df_cbp["SAAD CBP"]    = df_cbp[col_cbp] if col_cbp else 0
+        df_cbp["SAP COLGATE"] = df_cbp[col_sap] if col_sap else 0
+        df_cbp["DIFERENCIA"]  = df_cbp["SAAD CBP"] - df_cbp["SAP COLGATE"]
+        out_cbp_cols = base_cols + ["SAAD CBP","SAP COLGATE","DIFERENCIA"]
+        if not df_cbp.empty:
+            df_cbp = df_cbp[out_cbp_cols].sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
+        df_cbp.to_excel(w, "SAAD CBP vs SAP", index=False)
+
+        # BUNKER vs SAP (solo depósitos bunker ya resumidos por SKU)
+        df_bun = df.copy()
+        df_bun["SAAD BUNKER"] = df_bun[col_bunker] if col_bunker else 0
+        df_bun["SAP COLGATE"] = df_bun[col_sap]    if col_sap else 0
+        df_bun["DIFERENCIA"]  = df_bun["SAAD BUNKER"] - df_bun["SAP COLGATE"]
+        out_bun_cols = base_cols + ["SAAD BUNKER","SAP COLGATE","DIFERENCIA"]
+        if not df_bun.empty:
+            df_bun = df_bun[out_bun_cols].sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
+        df_bun.to_excel(w, "SAAD BUNKER vs SAP", index=False)
+
+        pd.DataFrame([res.get("resumen", {})]).to_excel(w, "Resumen", index=False)
+
+        # format widths
+        for sht in ["SAAD CBP vs SAP","SAAD BUNKER vs SAP"]:
             try:
                 ws = w.sheets[sht]
-                if match_mode == "code":
-                    ws.set_column(0, 0, 18)   # codigo
-                    ws.set_column(1, 1, 42)   # descripcion
-                    ws.set_column(2, 4, 16)   # cifras
+                if match_mode=="code":
+                    ws.set_column(0,0,18)
+                    ws.set_column(1,1,42)
+                    ws.set_column(2,4,16)
                 else:
-                    ws.set_column(0, 0, 18)   # codigo
-                    ws.set_column(1, 1, 10)   # storage
-                    ws.set_column(2, 2, 42)   # descripcion
-                    ws.set_column(3, 5, 16)   # cifras
+                    ws.set_column(0,0,18)
+                    ws.set_column(1,1,10)
+                    ws.set_column(2,2,42)
+                    ws.set_column(3,5,16)
             except Exception:
                 pass
 
@@ -470,88 +469,67 @@ def _xlsx_from_res(res: Dict, match_mode: str = "code") -> bytes:
     return buf.read()
 
 # =========================
-# Endpoints
+# Endpoint AUTO — sin parámetros
 # =========================
-@app.post("/cruce")
-async def cruce(
-    files: List[UploadFile] = File(...),
-    code_col: Optional[str] = None,
-    storage_col: Optional[str] = None,
-    desc_col: Optional[str] = None,
-    qty_col: Optional[str] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-    match_mode: str = "code",  # default por código
-    bunker_storages: Optional[str] = None,  # opcional; sobreescribe si lo pasás
-):
-    try:
-        global BUNKER_STORAGES
-        if bunker_storages:
-            BUNKER_STORAGES = {s.strip().upper() for s in bunker_storages.split(",") if s.strip()}
-
-        overrides = {
-            "code_col": code_col,
-            "storage_col": storage_col,
-            "desc_col": desc_col,
-            "qty_col": qty_col,
-        }
-        return await procesar_cruce(
-            files,
-            overrides=overrides,
-            only_storage=only_storage,
-            header_row=header_row,
-            match_mode=match_mode,
-        )
-    except Exception as e:
-        logger.exception("Error en /cruce")
-        return JSONResponse(status_code=500, content={"detail": f"/cruce: {e}"})
-
 @app.post(
-    "/cruce-xlsx",
+    "/cruce-auto-xlsx",
     responses={200: {
         "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
-        "description": "Cruce en Excel (dos pestañas: SAAD CBP vs SAP / SAAD BUNKER vs SAP).",
+        "description": "Subí SAP, SAAD CBP y SAAD BUNKER. Auto-detecta todo y devuelve Excel.",
     }},
 )
-async def cruce_xlsx(
-    files: List[UploadFile] = File(...),
-    code_col: Optional[str] = None,
-    storage_col: Optional[str] = None,
-    desc_col: Optional[str] = None,
-    qty_col: Optional[str] = None,
-    only_storage: Optional[str] = None,
-    header_row: Optional[int] = None,
-    match_mode: str = "code",  # default por código
-    bunker_storages: Optional[str] = None,
-):
+async def cruce_auto_xlsx(files: List[UploadFile] = File(...)):
     try:
-        global BUNKER_STORAGES
-        if bunker_storages:
-            BUNKER_STORAGES = {s.strip().upper() for s in bunker_storages.split(",") if s.strip()}
+        if not files or len(files) < 2:
+            raise HTTPException(status_code=400, detail="Subí al menos 2 archivos (SAP y SAAD). Idealmente 3: SAP, SAAD CBP y SAAD BUNKER.")
 
-        overrides = {
-            "code_col": code_col,
-            "storage_col": storage_col,
-            "desc_col": desc_col,
-            "qty_col": qty_col,
-        }
-        res = await procesar_cruce(
-            files,
-            overrides=overrides,
-            only_storage=only_storage,
-            header_row=header_row,
-            match_mode=match_mode,
-        )
-        xlsx_bytes = _xlsx_from_res(res, match_mode=match_mode)
+        labelled: List[Tuple[pd.DataFrame,str]] = []
+        seen_labels = set()
+
+        # leer + normalizar + clasificar automáticamente
+        for f in files:
+            df_raw = _read_any_table(f, header_row=None)
+            dfn = _normalize_df(df_raw)
+            lbl = _classify_label(df_raw, f.filename or "")
+            # si ya existe label (ej. 2 SAAD detectados iguales), intenta resolver:
+            if lbl in seen_labels and lbl in {"CBP","BUNKER"}:
+                # si el nombre del archivo ayuda, úsalo
+                name = (f.filename or "").lower()
+                if "bunker" in name:
+                    lbl = "BUNKER"
+                elif "cbp" in name:
+                    lbl = "CBP"
+                else:
+                    # heurística por depósitos
+                    st = set(dfn["storage"].dropna().astype(str).str.upper().unique())
+                    share = sum([s in BUNKER_STORAGES for s in st]) / max(1,len(st))
+                    lbl = "BUNKER" if share >= 0.5 else "CBP"
+
+            labelled.append((dfn, lbl))
+            seen_labels.add(lbl)
+
+        # si falta SAP, intenta forzar por nombre de archivo
+        if "SAP" not in {lbl for _,lbl in labelled}:
+            for i,(dfn,lbl) in enumerate(labelled):
+                if lbl not in {"CBP","BUNKER"}:
+                    labelled[i] = (dfn,"SAP")
+                    break
+
+        # merge por código (match_mode fijo = code)
+        res = _merge_and_build_result(labelled, match_mode="code")
+        xlsx = _xlsx_from_res(res, match_mode="code")
         return StreamingResponse(
-            io.BytesIO(xlsx_bytes),
+            io.BytesIO(xlsx),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'}
         )
     except Exception as e:
-        logger.exception("Error en /cruce-xlsx")
-        raise HTTPException(status_code=500, detail=f"/cruce-xlsx: {e}")
+        logger.exception("Error en /cruce-auto-xlsx")
+        raise HTTPException(status_code=500, detail=f"/cruce-auto-xlsx: {e}")
 
+# =========================
+# Endpoints manuales (siguen disponibles)
+# =========================
 @app.get("/healthz")
 def healthz():
     import pandas as _pd
