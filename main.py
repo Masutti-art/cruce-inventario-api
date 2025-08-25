@@ -1,293 +1,207 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import List, Optional, Tuple
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 import pandas as pd
-import numpy as np
-import io, re
+import io
+import re
+from typing import Dict, List, Tuple
 
 app = FastAPI(title="Cruce Inventario API", version="1.0")
 
-# ----------------------------
-# Utilidades de parsing/normalización
-# ----------------------------
+# Conjuntos de storages (según lo que nos pediste)
+CBP_STORAGES = {"OLR", "DR", "BN", "RT", "RP", "MOV", "COL"}  # CBP
+BUNKER_IN_SAP = {"AER"}                                      # BUNKER: SAP AER
 
-DECIMAL_SEP_RX = re.compile(r"[.,]")
+# ---- utilidades ---------------------------------------------------------------
 
-def _to_str(x) -> str:
-    if pd.isna(x):
+def _lower(s: str) -> str:
+    return re.sub(r"\s+", "", s or "").lower()
+
+def find_col(df: pd.DataFrame, candidates: List[str]) -> str:
+    """
+    Localiza una columna por nombres candidatos (ignorando mayúsculas/espacios).
+    Lanza 400 si no encuentra.
+    """
+    norm = {_lower(c): c for c in df.columns}
+    for wanted in candidates:
+        lw = _lower(wanted)
+        if lw in norm:
+            return norm[lw]
+        # búsqueda aproximada
+        for k in norm:
+            if lw in k:
+                return norm[k]
+    raise HTTPException(
+        status_code=400,
+        detail=f"No pude detectar columna. Necesito una de: {candidates}. Columnas recibidas: {list(df.columns)}",
+    )
+
+def read_any_excel(file: UploadFile) -> pd.DataFrame:
+    """
+    Lee .xlsx con openpyxl y .xls con xlrd 1.2.0.
+    Devuelve el primer sheet como DataFrame.
+    """
+    content = file.file.read()
+    file.file.seek(0)
+    bio = io.BytesIO(content)
+
+    name = (file.filename or "").lower()
+    if name.endswith(".xlsx"):
+        engine = "openpyxl"
+    elif name.endswith(".xls"):
+        engine = "xlrd"        # <= importante para .xls
+    else:
+        raise HTTPException(400, f"Formato no soportado: {file.filename}")
+
+    try:
+        df = pd.read_excel(bio, engine=engine, dtype=str)
+    except Exception as e:
+        raise HTTPException(400, f"No pude leer {file.filename} ({engine}). Error: {e}")
+    return df
+
+def norm_code(code: str) -> str:
+    """Normaliza el código: str, sin espacios y sin ceros a la izquierda típicos."""
+    if code is None:
         return ""
-    return str(x).strip()
-
-def normalize_desc(s: str) -> str:
-    s = _to_str(s).upper()
-    # quitar tildes simples y simbolos
-    s = re.sub(r"[ÁÀÄ]", "A", s)
-    s = re.sub(r"[ÉÈË]", "E", s)
-    s = re.sub(r"[ÍÌÏ]", "I", s)
-    s = re.sub(r"[ÓÒÖ]", "O", s)
-    s = re.sub(r"[ÚÙÜ]", "U", s)
-    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = str(code).strip()
+    # a veces vienen como 0000000MX04554A -> MX04554A
+    s = re.sub(r"^0+([A-Za-z].*)$", r"\1", s)
+    s = re.sub(r"^0+(\d.*)$", r"\1", s)
     return s
 
 def parse_qty(x) -> int:
     """
-    Convierte textos tipo '1.545,000' / '20,000' / 20422 a int.
-    Asume que las cantidades son en unidades (cajas), sin decimales reales.
+    Convierte cantidades con formato español: 1.545,000 -> 1545
+    y deja 0 para vacíos o no números.
     """
-    if pd.isna(x) or _to_str(x) == "":
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return 0
-    s = _to_str(x)
-    # quitar separadores de miles y comas/ puntos
-    s = s.replace(".", "").replace(",", "")
+    s = str(x).strip()
+    if s == "":
+        return 0
+    # quitar separador de miles ".", cambiar "," por "."
+    s = s.replace(".", "").replace(",", ".")
     try:
-        return int(float(s))
+        return int(round(float(s)))
     except Exception:
-        return 0
-
-def ensure_xls_engine(file: UploadFile) -> dict:
-    """Devuelve kwargs de read_excel según extensión."""
-    name = (file.filename or "").lower()
-    if name.endswith(".xls"):
-        # Para .xls hay que usar xlrd<2.0. A nivel código, pedimos engine="xlrd"
-        return {"engine": "xlrd"}
-    return {}
-
-# ----------------------------
-# Lectura de archivos
-# ----------------------------
-
-def read_sap(file: UploadFile) -> pd.DataFrame:
-    # columnas esperadas: Plant, Material, Material Description, Storage Location, BUM Quantity
-    try:
-        kwargs = ensure_xls_engine(file)
-        df = pd.read_excel(file.file, dtype=str, **kwargs)
-    finally:
-        file.file.seek(0)
-
-    # detectar columnas por nombre aproximado
-    cols = {c.lower(): c for c in df.columns}
-    def pick(*cands):
-        for c in cands:
-            if c in cols:
-                return cols[c]
-        return None
-
-    col_mat  = pick("material")
-    col_desc = pick("material description", "description", "material_description")
-    col_stor = pick("storage location", "storage_location", "storage")
-    col_qty  = pick("bum quantity", "quantity", "qty")
-
-    required = [col_mat, col_desc, col_stor, col_qty]
-    if any(c is None for c in required):
-        raise HTTPException(400, detail="Archivo SAP: columnas requeridas no detectadas (Material, Material Description, Storage Location, BUM Quantity).")
-
-    out = pd.DataFrame({
-        "codigo": df[col_mat].map(_to_str),
-        "descripcion": df[col_desc].map(_to_str),
-        "storage": df[col_stor].map(lambda x: _to_str(x).upper()),
-        "qty": df[col_qty].map(parse_qty),
-    })
-    out["desc_norm"] = out["descripcion"].map(normalize_desc)
-    return out
-
-def read_saad(file: UploadFile) -> pd.DataFrame:
-    # columnas esperadas: ubprod, itdesc, ubiest, ubcstk
-    try:
-        kwargs = ensure_xls_engine(file)
-        df = pd.read_excel(file.file, dtype=str, **kwargs)
-    finally:
-        file.file.seek(0)
-
-    cols = {c.lower(): c for c in df.columns}
-
-    # nom. frecuentes en CBP y BUNKER
-    col_code = cols.get("ubprod") or cols.get("codigo") or cols.get("code")
-    col_desc = cols.get("itdesc") or cols.get("descripcion") or cols.get("desc")
-    col_stor = cols.get("ubiest") or cols.get("storage") or cols.get("almacen") or cols.get("storage location")
-    col_qty  = cols.get("ubcstk") or cols.get("qty") or cols.get("cantidad") or cols.get("stock")
-
-    if any(x is None for x in [col_code, col_desc, col_stor, col_qty]):
-        raise HTTPException(400, detail="Archivo SAAD (CBP/BUNKER): no pude detectar columnas (ubprod/itdesc/ubiest/ubcstk).")
-
-    out = pd.DataFrame({
-        "codigo": df[col_code].map(_to_str),
-        "descripcion": df[col_desc].map(_to_str),
-        "storage": df[col_stor].map(lambda x: _to_str(x).upper()),
-        "qty": df[col_qty].map(parse_qty),
-    })
-
-    # limpiar prefijos tipo '0000000' de SAAD sin romper alfanuméricos
-    out["codigo"] = out["codigo"].str.replace(r"^0+(?=[A-Z0-9])", "", regex=True)
-    out["desc_norm"] = out["descripcion"].map(normalize_desc)
-    return out
-
-# ----------------------------
-# Lógica de filtros y cruce
-# ----------------------------
-
-CBP_STORAGES = {"COL", "OLR", "DR", "BN", "RT", "RP", "MOV"}
-BUNKER_SAP_STORAGES = {"AER"}
-
-def filtrar_sap_por_sitio(df_sap: pd.DataFrame, sitio: str) -> pd.DataFrame:
-    if sitio == "CBP":
-        return df_sap[df_sap["storage"].isin(CBP_STORAGES)].copy()
-    elif sitio == "BUNKER":
-        return df_sap[df_sap["storage"].isin(BUNKER_SAP_STORAGES)].copy()
-    else:
-        return df_sap.copy()
-
-def agrupar(df: pd.DataFrame) -> pd.DataFrame:
-    # Agrupa por código y descripción normalizada
-    g = df.groupby(["codigo", "desc_norm"], dropna=False, as_index=False)["qty"].sum()
-    return g
-
-def cruce(df_saad: pd.DataFrame, df_sap: pd.DataFrame, etiqueta_saad: str, match_mode: str="auto") -> pd.DataFrame:
-    """
-    match_mode: 'code' (solo código), 'desc' (solo por desc_norm), 'auto' (código y luego desc)
-    """
-    a = agrupar(df_saad).rename(columns={"qty": "saad_qty"})
-    s = agrupar(df_sap ).rename(columns={"qty": "sap_qty"})
-
-    # 1) Merge por código
-    df = a.merge(s, on="codigo", how="outer", suffixes=("",""))
-    df["match"] = np.where(df["sap_qty"].notna() & df["saad_qty"].notna(), "code", "")
-
-    if match_mode in ("auto", "desc"):
-        # 2) donde no matcheó por código, intentar por descripción
-        mask = df["match"].eq("")  # no match aún
-        a_pending = a[~a["codigo"].isin(df.loc[~mask, "codigo"])]
-        s_pending = s[~s["codigo"].isin(df.loc[~mask, "codigo"])]
-
-        if not a_pending.empty and not s_pending.empty:
-            ddesc = a_pending.merge(s_pending, on="desc_norm", how="outer", suffixes=("",""), indicator=True)
-            ddesc = ddesc[ddesc["_merge"]!="right_only"].copy()
-            # completar en df original los que faltaban
-            if not ddesc.empty:
-                # combinamos con lo ya existente
-                resto = ddesc[["codigo_x","desc_norm","saad_qty","sap_qty"]].rename(columns={"codigo_x":"codigo"})
-                resto["match"] = "desc"
-                # unir y luego eliminar duplicados conservando los ya 'code'
-                df = pd.concat([df, resto], ignore_index=True)
-                df = df.sort_values(by=["codigo","match"], ascending=[True, True]).drop_duplicates(subset=["codigo","desc_norm"], keep="first")
-
-    # completar descripciones legibles:
-    # intentamos traer una buena 'descripcion' desde cualquiera de las fuentes
-    # como no siempre coincide, regeneramos vía un diccionario auxiliar
-    df_desc_saad = df_saad[["codigo","desc_norm","descripcion"]].drop_duplicates()
-    df_desc_sap  = df_sap [["codigo","desc_norm","descripcion"]].drop_duplicates()
-
-    df = df.merge(df_desc_saad, on=["codigo","desc_norm"], how="left")
-    df = df.rename(columns={"descripcion": "desc_saad"})
-    df = df.merge(df_desc_sap, on=["codigo","desc_norm"], how="left")
-    df = df.rename(columns={"descripcion": "desc_sap"})
-
-    # preferir desc de SAAD y si no existe usar SAP
-    df["descripcion"] = df["desc_saad"].fillna(df["desc_sap"])
-    df = df.drop(columns=["desc_saad","desc_sap"])
-
-    df["saad_qty"] = df["saad_qty"].fillna(0).astype(int)
-    df["sap_qty"]  = df["sap_qty"].fillna(0).astype(int)
-    df["diferencia"] = df["saad_qty"] - df["sap_qty"]
-
-    # presentación
-    df_out = df[["codigo","descripcion","saad_qty","sap_qty","diferencia","match"]].copy()
-    df_out = df_out.rename(columns={
-        "saad_qty": etiqueta_saad,
-        "sap_qty": "SAP COLGATE",
-        "diferencia": "DIFERENCIA"
-    })
-    # ordenar por |dif|
-    df_out = df_out.sort_values(by="DIFERENCIA", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
-    return df_out
-
-def escribir_excel(cbvssap: pd.DataFrame, bkvssap: pd.DataFrame) -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        # Resumen
-        resumen = pd.DataFrame({
-            "reporte": ["CBP_vs_SAP","BUNKER_vs_SAP"],
-            "filas":   [len(cbvssap), len(bkvssap)],
-            "sum_dif_abs": [int(cbvssap["DIFERENCIA"].abs().sum()),
-                            int(bkvssap["DIFERENCIA"].abs().sum())],
-        })
-        resumen.to_excel(writer, index=False, sheet_name="Resumen")
-
-        cbvssap.to_excel(writer, index=False, sheet_name="CBP_vs_SAP")
-        bkvssap.to_excel(writer, index=False, sheet_name="BUNKER_vs_SAP")
-    bio.seek(0)
-    return bio.getvalue()
-
-# ----------------------------
-# Endpoints
-# ----------------------------
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-def detectar_archivos(uploads: List[UploadFile]) -> Tuple[UploadFile, UploadFile, UploadFile]:
-    sap = cbp = bunker = None
-    for f in uploads:
-        name = (f.filename or "").upper()
-        # por nombre si se puede
-        if "SAP" in name and sap is None:
-            sap = f
-        elif "CBP" in name and cbp is None:
-            cbp = f
-        elif "BUNKER" in name and bunker is None:
-            bunker = f
-
-    # si por nombre no alcanza, intentar por columnas
-    for f in uploads:
-        if f in (sap, cbp, bunker):
-            continue
+        # último intento (por si ya era entero)
         try:
-            kwargs = ensure_xls_engine(f)
-            df_head = pd.read_excel(f.file, nrows=1, dtype=str, **kwargs)
-            f.file.seek(0)
-            cols = set(c.lower() for c in df_head.columns)
-            if {"plant", "material", "storage location", "bum quantity"} <= cols and sap is None:
-                sap = f
-            elif {"ubprod","itdesc","ubiest","ubcstk"} <= cols:
-                # si falta alguno asigno al que esté libre
-                if cbp is None:
-                    cbp = f
-                elif bunker is None:
-                    bunker = f
+            return int(float(x))
         except Exception:
-            f.file.seek(0)
-            continue
+            return 0
 
-    if not (sap and cbp and bunker):
-        raise HTTPException(400, detail="Debes enviar 3 archivos: SAP, SAAD CBP y SAAD BUNKER.")
-    return sap, cbp, bunker
+def group_sap(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detecta columnas en SAP y devuelve pivot por (codigo, storage)
+    sumando 'BUM Quantity'.
+    """
+    c_code   = find_col(df, ["Material"])
+    c_desc   = find_col(df, ["Material Description"])
+    c_store  = find_col(df, ["Storage Location"])
+    c_qty    = find_col(df, ["BUM Quantity", "Quantity", "Qty"])
+
+    out = df[[c_code, c_desc, c_store, c_qty]].copy()
+    out[c_code]  = out[c_code].map(norm_code)
+    out[c_desc]  = out[c_desc].fillna("").astype(str).str.strip()
+    out[c_store] = out[c_store].fillna("").astype(str).str.strip().str.upper()
+    out[c_qty]   = out[c_qty].map(parse_qty)
+
+    out = (
+        out.groupby([c_code, c_desc, c_store], as_index=False)[c_qty]
+           .sum()
+           .rename(columns={c_code: "codigo", c_desc: "descripcion",
+                            c_store: "storage", c_qty: "sap_qty"})
+    )
+    return out
+
+def group_saad(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """
+    Detecta ubprod/itdesc/ubiest/ubcstk en SAAD y devuelve
+    (codigo, storage, descripcion, qty)
+    """
+    c_code   = find_col(df, ["ubprod"])
+    c_desc   = find_col(df, ["itdesc"])
+    c_store  = find_col(df, ["ubiest"])
+    c_qty    = find_col(df, ["ubcstk", "qty", "cantidad"])
+
+    out = df[[c_code, c_desc, c_store, c_qty]].copy()
+    out[c_code]  = out[c_code].map(norm_code)
+    out[c_desc]  = out[c_desc].fillna("").astype(str).str.strip()
+    out[c_store] = out[c_store].fillna("").astype(str).str.strip().str.upper()
+    out[c_qty]   = out[c_qty].map(parse_qty)
+
+    out = (
+        out.groupby([c_code, c_desc, c_store], as_index=False)[c_qty]
+           .sum()
+           .rename(columns={c_code: "codigo", c_desc: "descripcion",
+                            c_store: "storage", c_qty: f"saad_{label}_qty"})
+    )
+    return out
+
+def compare_by_code(saad: pd.DataFrame, sap: pd.DataFrame, sheet_label: str) -> pd.DataFrame:
+    """
+    Compara por código (sin cruzar storage), sumando por código.
+    Devuelve columnas: codigo, descripcion, SAAD_x, SAP, DIFERENCIA (SAAD - SAP)
+    """
+    saad_agg = (
+        saad.groupby(["codigo", "descripcion"], as_index=False)
+            [saad.columns[-1]].sum()
+    )
+    saad_col = saad_agg.columns[-1]
+    sap_agg = sap.groupby(["codigo", "descripcion"], as_index=False)["sap_qty"].sum()
+
+    df = pd.merge(saad_agg, sap_agg, on=["codigo", "descripcion"], how="outer")
+    df[saad_col] = df[saad_col].fillna(0).astype(int)
+    df["sap_qty"] = df["sap_qty"].fillna(0).astype(int)
+    df["DIFERENCIA"] = df[saad_col] - df["sap_qty"]
+    df = df.sort_values("DIFERENCIA", key=lambda s: s.abs(), ascending=False)
+    # Renombrado legible en hoja
+    if "bunker" in sheet_label.lower():
+        df = df.rename(columns={saad_col: "SAAD BUNKER", "sap_qty": "SAP COLGATE"})
+    else:
+        df = df.rename(columns={saad_col: "SAAD CBP", "sap_qty": "SAP COLGATE"})
+    return df[["codigo", "descripcion"] + [c for c in df.columns if c not in {"codigo","descripcion"}]]
+
+# ---- endpoints ----------------------------------------------------------------
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
 
 @app.post("/cruce-auto-xlsx")
-async def cruce_auto_xlsx(files: List[UploadFile] = File(...)):
-    if len(files) < 3:
-        raise HTTPException(400, detail="Envía los 3 archivos (SAP, CBP, BUNKER).")
-    sap_f, cbp_f, bunker_f = detectar_archivos(files)
-
-    df_sap = read_sap(sap_f)
-    df_cbp = read_saad(cbp_f)
-    df_bkr = read_saad(bunker_f)
-
-    sap_cbp = filtrar_sap_por_sitio(df_sap, "CBP")
-    sap_bkr = filtrar_sap_por_sitio(df_sap, "BUNKER")
-
-    cbp_vs_sap = cruce(df_cbp, sap_cbp, etiqueta_saad="SAAD CBP", match_mode="auto")
-    bkr_vs_sap = cruce(df_bkr, sap_bkr, etiqueta_saad="SAAD BUNKER", match_mode="auto")
-
-    xlsx_bytes = escribir_excel(cbp_vs_sap, bkr_vs_sap)
-    return StreamingResponse(io.BytesIO(xlsx_bytes),
-                             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'})
-
-@app.post("/cruce-xlsx")
-async def cruce_xlsx(
-    files: List[UploadFile] = File(...),
-    match_mode: str = Query("auto", regex="^(auto|code|desc)$")
+async def cruce_auto_xlsx(
+    files: List[UploadFile] = File(..., description="Archivos en orden: 1) SAP (.xlsx), 2) SAAD CBP (.xls), 3) SAAD BUNKER (.xls)")
 ):
-    # mismo que el auto
-    return await cruce_auto_xlsx(files)
+    # Validación básica
+    if len(files) != 3:
+        raise HTTPException(400, "Debes subir 3 archivos: SAP (.xlsx), SAAD_CBP (.xls) y SAAD_BUNKER (.xls)")
+
+    # Lee
+    sap_df    = read_any_excel(files[0])
+    cbp_df    = read_any_excel(files[1])
+    bunker_df = read_any_excel(files[2])
+
+    # Agrupa / normaliza
+    sap = group_sap(sap_df)
+    saad_cbp = group_saad(cbp_df, label="cbp")
+    saad_bunker = group_saad(bunker_df, label="bunker")
+
+    # Filtros por storage
+    sap_cbp    = sap[sap["storage"].isin(CBP_STORAGES)].copy()
+    sap_bunker = sap[sap["storage"].isin(BUNKER_IN_SAP)].copy()
+
+    # Compara por código (sumado) – así no dependemos de que los nombres de storage coincidan 1 a 1
+    sheet_cbp    = compare_by_code(saad_cbp, sap_cbp, sheet_label="CBP vs SAP")
+    sheet_bunker = compare_by_code(saad_bunker, sap_bunker, sheet_label="BUNKER vs SAP")
+
+    # Excel de salida con 2 hojas
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sheet_cbp.to_excel(writer, index=False, sheet_name="CBP_vs_SAP")
+        sheet_bunker.to_excel(writer, index=False, sheet_name="BUNKER_vs_SAP")
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="cruce_ordenado.xlsx"'},
+    )
