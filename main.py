@@ -12,15 +12,14 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI(title="Cruce Inventario API", version="1.4.0")
+app = FastAPI(title="Cruce Inventario API", version="1.5.0")
 logger = logging.getLogger("uvicorn.error")
 
 # =========================
 # Configuración
 # =========================
-# Por defecto consideramos BUNKER = {"AER"}.
-# Podés ampliarlo en runtime con el query param: ?bunker_storages=AER,OLR,DR,...
-BUNKER_STORAGES = {"AER"}
+# BUNKER fijo según tu pedido:
+BUNKER_STORAGES = {"AER", "MOV", "RT", "RP", "BN", "OLR"}
 
 DEFAULT_CODE_COL = "MATERIAL"
 DEFAULT_QTY_COL = "SALDO"
@@ -101,8 +100,7 @@ def _clean_code(x: str) -> Optional[str]:
     s = str(x).strip()
     if s == "" or s.upper() in {"TOTAL", "RESUMEN", "SUBTOTAL", "NA", "N/A", "-", "NAN"}:
         return None
-    # 0000123 → 123 | 0000ABC → ABC
-    s = re.sub(r"^0+(?=[A-Za-z0-9])", "", s)
+    s = re.sub(r"^0+(?=[A-Za-z0-9])", "", s)  # 0000123 -> 123 ; 0000ABC -> ABC
     s = s.upper()
     return s if s else None
 
@@ -127,7 +125,7 @@ def _read_any_table(file: UploadFile, header_row: Optional[int] = None) -> pd.Da
             for hdr in range(0, 31):
                 try:
                     df = _read_excel_try(file.file, engine, hdr)
-                    if not df.dropna(how="all").empty and len(df.columns) >= 2:
+                    if not df.dropna(hoy="all").empty and len(df.columns) >= 2:
                         return df
                 except Exception:
                     continue
@@ -164,6 +162,42 @@ def _friendly_label(label: str) -> str:
         return "BUNKER"
     return re.sub(r"[^A-Z0-9]+", "_", U)[:20].strip("_")
 
+# ====== PASO B: conversión robusta de cantidades ======
+def _parse_qty(val) -> float:
+    """
+    Convierte cantidades que vienen como texto con separadores
+    (ej: '1.234', '12.345,00', '9,876', '  1 234 ') a número.
+    Si no puede, devuelve 0.
+    """
+    if pd.isna(val):
+        return 0.0
+    s = str(val).strip().replace("\u00A0", " ")  # NBSP
+    if s == "":
+        return 0.0
+
+    # Caso típico europeo: 12.345,67  ->  12345.67
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # Si solo hay comas y no puntos, suele ser decimal: 123,45 -> 123.45
+        # Si solo hay puntos (miles) -> quitamos puntos
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(".", "")
+
+    try:
+        return float(s)
+    except Exception:
+        # Plan B: quita todo menos dígitos y signo
+        digits = re.sub(r"[^0-9\-]", "", s)
+        if digits in ("", "-"):
+            return 0.0
+        try:
+            return float(digits)
+        except Exception:
+            return 0.0
+
 # =========================
 # Normalización por archivo
 # =========================
@@ -191,7 +225,8 @@ def _normalize_df(
     out["codigo"] = df[codigo_col].map(_clean_code)
     out["storage"] = df[storage_col].map(_clean_storage) if storage_col else ""
     out["descripcion"] = df[desc_col].astype(str) if desc_col else ""
-    out["cajas"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+    # ====== PASO B aplicado ======
+    out["cajas"] = df[qty_col].map(_parse_qty).fillna(0)
 
     # descartar filas sin código
     out = out.dropna(subset=["codigo"])
@@ -212,7 +247,7 @@ async def procesar_cruce(
     overrides: Optional[Dict] = None,
     only_storage: Optional[str] = None,
     header_row: Optional[int] = None,
-    match_mode: str = "code_storage",  # "code" ó "code_storage"
+    match_mode: str = "code",  # por código como default
 ) -> Dict:
     overrides = overrides or {}
     if not files or len(files) < 2:
@@ -326,7 +361,7 @@ async def procesar_cruce(
 # =========================
 # Excel: dos pestañas + resumen
 # =========================
-def _xlsx_from_res(res: Dict, match_mode: str = "code_storage") -> bytes:
+def _xlsx_from_res(res: Dict, match_mode: str = "code") -> bytes:
     """
     Genera un XLSX con:
      - 'SAAD CBP vs SAP'    (NO BUNKER_STORAGES)
@@ -419,20 +454,15 @@ def _xlsx_from_res(res: Dict, match_mode: str = "code_storage") -> bytes:
         for sht in ["SAAD CBP vs SAP", "SAAD BUNKER vs SAP"]:
             try:
                 ws = w.sheets[sht]
-                col0 = 0   # codigo
-                col1 = 1   # storage o descripcion (según match_mode)
-                col2 = 2
                 if match_mode == "code":
-                    # codigo | descripcion | cifras
-                    ws.set_column(col0, col0, 18)
-                    ws.set_column(col1, col1, 42)
-                    ws.set_column(col2, col2+2, 16)
+                    ws.set_column(0, 0, 18)   # codigo
+                    ws.set_column(1, 1, 42)   # descripcion
+                    ws.set_column(2, 4, 16)   # cifras
                 else:
-                    # codigo | storage | descripcion | cifras
-                    ws.set_column(col0, col0, 18)
-                    ws.set_column(col1, col1, 10)
-                    ws.set_column(col2, col2, 42)
-                    ws.set_column(col2+1, col2+2, 16)
+                    ws.set_column(0, 0, 18)   # codigo
+                    ws.set_column(1, 1, 10)   # storage
+                    ws.set_column(2, 2, 42)   # descripcion
+                    ws.set_column(3, 5, 16)   # cifras
             except Exception:
                 pass
 
@@ -451,11 +481,10 @@ async def cruce(
     qty_col: Optional[str] = None,
     only_storage: Optional[str] = None,
     header_row: Optional[int] = None,
-    match_mode: str = "code_storage",             # NUEVO
-    bunker_storages: Optional[str] = None,         # NUEVO
+    match_mode: str = "code",  # default por código
+    bunker_storages: Optional[str] = None,  # opcional; sobreescribe si lo pasás
 ):
     try:
-        # Actualizar depósitos BUNKER si vienen como query
         global BUNKER_STORAGES
         if bunker_storages:
             BUNKER_STORAGES = {s.strip().upper() for s in bunker_storages.split(",") if s.strip()}
@@ -492,11 +521,10 @@ async def cruce_xlsx(
     qty_col: Optional[str] = None,
     only_storage: Optional[str] = None,
     header_row: Optional[int] = None,
-    match_mode: str = "code_storage",             # NUEVO
-    bunker_storages: Optional[str] = None,         # NUEVO
+    match_mode: str = "code",  # default por código
+    bunker_storages: Optional[str] = None,
 ):
     try:
-        # Actualizar depósitos BUNKER si vienen como query
         global BUNKER_STORAGES
         if bunker_storages:
             BUNKER_STORAGES = {s.strip().upper() for s in bunker_storages.split(",") if s.strip()}
