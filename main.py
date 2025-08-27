@@ -6,7 +6,7 @@ import re
 
 app = FastAPI(title="Cruce Inventario API", version="1.0")
 
-# ---------- Utilidades ----------
+# ------------------ Utilidades ------------------
 
 def _pick_engine(filename: str) -> str:
     fn = filename.lower()
@@ -44,14 +44,14 @@ def _estado_key(val: str) -> int:
     val = (val or "").upper().strip()
     return ESTADO_ORDER.get(val, 99)
 
-# ---------- Lecturas ----------
+# ------------------ Lecturas ------------------
 
 def read_sap(file: UploadFile) -> pd.DataFrame:
     """
     SAP: columnas esperadas:
     - Material (código)
     - Material Description (descripción)
-    - Storage Location (AER / OLR / COL / …)
+    - Storage Location (ej. AER/OLR/COL)
     - BUM Quantity (cajas)
     """
     engine = _pick_engine(file.filename)
@@ -75,7 +75,7 @@ def read_sap(file: UploadFile) -> pd.DataFrame:
     sap = pd.DataFrame({
         "codigo":      df[col_code].map(_norm_code),
         "descripcion": df[col_desc].map(_norm_text),
-        "ubiest":      df[col_storage].map(lambda x: _norm_text(x).upper()),  # ubiest = storage
+        "ubiest":      df[col_storage].map(lambda x: _norm_text(x).upper()),
         "cajas":       df[col_qty].map(_to_int),
     })
     sap = sap.groupby(["codigo", "descripcion", "ubiest"], as_index=False)["cajas"].sum()
@@ -109,7 +109,6 @@ def read_saad_cpb(file: UploadFile) -> pd.DataFrame:
     sad = pd.DataFrame({
         "codigo":      df[col_code].map(_norm_code),
         "descripcion": df[col_desc].map(_norm_text),
-        # por si viniera "OLR - UR", me quedo solo con el storage
         "ubiest":      df[col_ubiest].map(lambda x: _norm_text(x).split(" - ")[0].upper()),
         "cajas":       df[col_qty].map(_to_int),
     })
@@ -141,14 +140,17 @@ def read_saad_bunker(file: UploadFile, split_by_estado: bool = True) -> pd.DataF
     if not all([col_code, col_desc, col_ubiest, col_qty]):
         raise ValueError("SAAD BUNKER: faltan columnas (ubprod, itdesc, ubiest, ubcstk).")
 
+    # Forzamos string para que .str funcione sí o sí
+    ub_raw = df[col_ubiest].astype(str)
+
     raw = pd.DataFrame({
         "codigo":      df[col_code].map(_norm_code),
         "descripcion": df[col_desc].map(_norm_text),
-        "ubiest_raw":  df[col_ubiest].map(_norm_text),
+        "ubiest_raw":  ub_raw.map(_norm_text),
         "cajas":       df[col_qty].map(_to_int),
     })
 
-    # ubiest_raw: 'OLR - UR' o 'AER - QI'
+    # ubiest_raw: 'OLR - UR' o 'AER - QI' ...
     raw["ubiest"] = raw["ubiest_raw"].str.extract(r"^\s*([A-Za-z]+)").fillna("").str.upper()
     raw["estado"] = raw["ubiest_raw"].str.extract(r"-\s*([A-Za-z]+)\s*$").fillna("").str.upper()
 
@@ -159,7 +161,7 @@ def read_saad_bunker(file: UploadFile, split_by_estado: bool = True) -> pd.DataF
         out["estado"] = ""
     return out
 
-# ---------- Cruces ----------
+# ------------------ Cruces ------------------
 
 def cruzar(df_left: pd.DataFrame, df_right: pd.DataFrame,
            on_cols: list, left_name: str, right_name: str) -> pd.DataFrame:
@@ -170,7 +172,7 @@ def cruzar(df_left: pd.DataFrame, df_right: pd.DataFrame,
     cols = [c for c in on_cols] + [left_name, right_name, "DIFERENCIA"]
     return merged[cols].fillna("")
 
-# ---------- Endpoint ----------
+# ------------------ Endpoint ------------------
 
 @app.post("/cruce-auto-xlsx")
 async def cruce_auto_xlsx(
@@ -185,10 +187,9 @@ async def cruce_auto_xlsx(
 
         sap_file, cbp_file, bunker_file = files
 
-        sap    = read_sap(sap_file)                      # codigo, descripcion, ubiest, cajas
-        cbp    = read_saad_cpb(cbp_file)                 # codigo, descripcion, ubiest, cajas
+        sap    = read_sap(sap_file)
+        cbp    = read_saad_cpb(cbp_file)
         bunker = read_saad_bunker(bunker_file, split_by_estado=split_by_estado)
-        # bunker: codigo, descripcion, ubiest, (estado), cajas
 
         # Filtros por storage (ubiest)
         stor_cbp = [s.strip().upper() for s in sap_cbp_storages.split(",") if s.strip()]
@@ -200,7 +201,7 @@ async def cruce_auto_xlsx(
         sap_bun   = sap[sap["ubiest"].isin(stor_bun)] if stor_bun else sap.copy()
         bunker_f  = bunker[bunker["ubiest"].isin(stor_bun)] if stor_bun else bunker.copy()
 
-        # ---- CBP vs SAP (AHORA con ubiest) ----
+        # ---- CBP vs SAP (con ubiest) ----
         cbp_g = cbp_f.groupby(["codigo", "descripcion", "ubiest"], as_index=False)["cajas"].sum()
         sap_g = sap_cbp.groupby(["codigo", "descripcion", "ubiest"], as_index=False)["cajas"].sum()
         cbp_vs_sap = cruzar(
@@ -211,20 +212,21 @@ async def cruce_auto_xlsx(
             right_name="SAP COLGATE"
         ).sort_values(["ubiest", "codigo"])
 
-        # ---- BUNKER vs SAP (por estado) ----
+        # ---- BUNKER vs SAP ----
         if split_by_estado:
             left  = bunker_f.groupby(["codigo", "descripcion", "ubiest", "estado"], as_index=False)["cajas"].sum()
             right = sap_bun.groupby(["codigo", "descripcion", "ubiest"], as_index=False)["cajas"].sum()
+
             bun_vs_sap = pd.merge(left, right, on=["codigo", "descripcion", "ubiest"], how="left")
             bun_vs_sap["SAAD BUNKER"] = bun_vs_sap.pop("cajas_x").fillna(0).astype(int)
             bun_vs_sap["SAP COLGATE"] = bun_vs_sap.pop("cajas_y").fillna(0).astype(int)
             bun_vs_sap["DIFERENCIA"]  = (bun_vs_sap["SAAD BUNKER"] - bun_vs_sap["SAP COLGATE"]).astype(int)
+
+            # Orden robusto sin key (evita el error)
+            bun_vs_sap["estado_ord"] = bun_vs_sap["estado"].map(_estado_key)
             bun_vs_sap = bun_vs_sap[["codigo", "descripcion", "ubiest", "estado",
-                                     "SAAD BUNKER", "SAP COLGATE", "DIFERENCIA"]]
-            bun_vs_sap = bun_vs_sap.sort_values(
-                by=["ubiest", "codigo", "estado"],
-                key=lambda s: s.map(_estado_key) if s.name == "estado" else s
-            )
+                                     "SAAD BUNKER", "SAP COLGATE", "DIFERENCIA", "estado_ord"]]
+            bun_vs_sap = bun_vs_sap.sort_values(by=["ubiest", "codigo", "estado_ord"]).drop(columns=["estado_ord"])
         else:
             bun_vs_sap = cruzar(
                 df_left=bunker_f.groupby(["codigo", "descripcion", "ubiest"], as_index=False)["cajas"].sum(),
