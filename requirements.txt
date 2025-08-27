@@ -1,14 +1,15 @@
 pip>=24.2
 setuptools>=68
 wheel>=0.43
+
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+
 pandas==2.2.2
-openpyxl==3.1.5
-xlrd==2.0.1
-pyxlsb==1.0.10
-odfpy==1.4.1
+openpyxl==3.1.5         # para .xlsx (SAP)
+xlrd==1.2.0             # para .xls (SAAD)
+pyxlsb==1.0.10          # (opcional) .xlsb
+
+odfpy==1.4.1            # opcional
 python-multipart==0.0.9
 XlsxWriter==3.1.9
-
-
